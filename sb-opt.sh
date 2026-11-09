@@ -179,7 +179,6 @@ cmd_audit() {
   mem_total=$(awk '/MemTotal/{printf "%.0f", $2/1024}' /proc/meminfo)
   mem_used=$(awk '/MemAvailable/{printf "%.0f", ('"$mem_total"'*1024-$2)/1024}' /proc/meminfo)
   printf '  内存    : %sMB 总 / 约 %sMB 已用\n' "$mem_total" "$mem_used"
-  [ "$mem_total" -lt 3000 ] && swapon --show 2>/dev/null | grep -q . || true
   printf '  Swap    : %s\n' "$(swapon --show --noheadings 2>/dev/null | awk '{print $3}' | head -1)"
 
   printf '  拥塞控制: %s' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
