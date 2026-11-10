@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.4.3
+# VERSION 1.5.2
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -854,8 +854,8 @@ cmd_audit() {
     local f2 i2
     f2=$(printf '%s' "$e2" | cut -d'|' -f1)
     i2=$(printf '%s' "$e2" | cut -d'|' -f2)
-    if [ "$seen_reality" = 0 ] && jq -e ".inbounds[$i2].type==\"vless\" and .inbounds[$i2].tls.reality.enabled==true and (.inbounds[$i2].tls.utls.fingerprint//\"\")!=\"chrome\"" "$(readable_file "$f2")" >/dev/null 2>&1; then
-      dim "· REALITY 未设 utls=chrome -> 执行 tune"; seen_reality=1
+    if [ "$seen_reality" = 0 ] && qjq -e '.inbounds['"$i2"'].type=="vless" and .inbounds['"$i2"'].tls.reality.enabled==true and ((.inbounds['"$i2"'].tls.reality.short_id | if type=="array" then (.[0] // "") else (. // "") end) == "")' "$f2" >/dev/null 2>&1; then
+      dim "· 有 REALITY 入站 short_id 为空 -> 建议补一个随机 shortId"; seen_reality=1
     fi
     if [ "$seen_obfs" = 0 ] && jq -e ".inbounds[$i2].type==\"hysteria2\" and (.inbounds[$i2].obfs.type//\"\")==\"\"" "$(readable_file "$f2")" >/dev/null 2>&1; then
       dim "· Hysteria2 未加 obfs，UDP 易被 QoS -> 执行 tune"; seen_obfs=1
@@ -919,6 +919,24 @@ EOF
   [ "$cc" = "bbr" ] && ok "拥塞控制 = bbr" || err "拥塞控制 = $cc（未生效）"
   [ "$qd" = "fq" ]  && ok "队列算法 = fq"   || warn "队列算法 = $qd"
 
+  # default_qdisc 只作用于新建网卡；已存在的网卡要 tc 显式替换
+  local dev main_dev
+  main_dev=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+  for dev in $(
+    { echo "${main_dev:-}"; ip -o link show 2>/dev/null | awk -F': ' '{print $2}'; } \
+    | awk 'NF' | grep -vE '^(lo|docker.*|veth.*|br-.*|tun.*|sing.*|wg.*)$' | sort -u
+  ); do
+    [ -d "/sys/class/net/$dev" ] || continue
+    if tc qdisc replace dev "$dev" root fq 2>/dev/null; then
+      ok "$dev 队列 -> fq"
+    else
+      warn "$dev 设置 fq 失败（驱动不支持？）"
+    fi
+  done
+  local q_show
+  q_show=$(tc qdisc show dev "${main_dev:-eth0}" 2>/dev/null | head -1)
+  [ -n "$q_show" ] && dim "当前：$q_show"
+
   if ! swapon --show 2>/dev/null | grep -q .; then
     say "创建 1G swap"
     if fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none; then
@@ -980,22 +998,16 @@ cmd_tune() {
     [ "$type" = "vless" ] || continue
     qjq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
 
-    local fp hs
-    fp=$(qjq -r ".inbounds[$i].tls.utls.fingerprint // \"\"" "$f")
+    local hs sid
     hs=$(qjq -r ".inbounds[$i].tls.reality.handshake.server // .inbounds[$i].tls.server_name // \"-\"" "$f")
+    sid=$(qjq -r '.inbounds[$i].tls.reality.short_id | if type=="array" then (.[0] // "") else (. // "") end' "$f")
 
     hr; printf '  REALITY 入站 [%s]  (%s)\n' "$tag" "$(basename "$f")"
     printf '    伪装站 : %s\n' "$hs"
-    printf '    指纹   : %s\n' "${fp:-（未设置）}"
-
-    if [ "$fp" != "chrome" ]; then
-      if ask "把 utls 指纹设为 chrome？（更像真实浏览器，抗识别）"; then
-        apply_file "$f" "REALITY[$tag] utls=chrome" \
-          ".inbounds[$i].tls.utls = {\"enabled\": true, \"fingerprint\": \"chrome\"}" && changed=1
-      fi
-    else
-      ok "指纹已是 chrome"
-    fi
+    printf '    shortId: %s\n' "${sid:-（空）}"
+    dim "    uTLS 指纹（fp=chrome）属于客户端参数，服务端没有这个字段；"
+    dim "    生成的链接里已带 fp=chrome，无需在服务器上设置"
+    [ -z "$sid" ] && warn "short_id 为空，建议填一个随机值（sbopt 不自动改，避免客户端失联）"
   done
 
   # ---------- Hysteria2 ----------
@@ -1062,20 +1074,34 @@ cmd_dest() {
   local hosts=(www.microsoft.com www.apple.com swcdn.apple.com
                www.cloudflare.com www.bing.com www.tesla.com
                one.one.one.one dl.google.com)
-  printf '  %-24s %-10s %-10s %s\n' "站点" "TCP连接" "TLS握手" "HTTP版本"
-  printf '  %s\n' "$(printf '%.0s-' {1..58})"
-  local h c a hv
+  printf '  %-24s %-10s %-10s %-6s %s\n' "站点" "TCP连接" "TLS握手" "HTTP" "TLS1.3"
+  printf '  %s\n' "$(printf '%.0s-' {1..62})"
+  local h c a hv t13 best="" rc13
   for h in "${hosts[@]}"; do
+    # 先用 --tlsv1.3 探测；成功即代表支持 TLS1.3
     read -r c a hv < <(
-      curl -sI -o /dev/null --max-time 6 --tlsv1.3 \
+      curl -sI -o /dev/null --max-time 8 --tlsv1.3 \
            -w '%{time_connect} %{time_appconnect} %{http_version}' "https://$h" 2>/dev/null
       echo
     )
+    if [ -n "${c:-}" ]; then t13="✓"; else
+      read -r c a hv < <(
+        curl -sI -o /dev/null --max-time 8 \
+             -w '%{time_connect} %{time_appconnect} %{http_version}' "https://$h" 2>/dev/null
+        echo
+      )
+      [ -n "${c:-}" ] && t13="—" || t13="?"
+    fi
     [ -z "${c:-}" ] && { printf '  %-24s %s\n' "$h" "不可用"; continue; }
-    printf '  %-24s %-10s %-10s %s\n' "$h" "${c}s" "${a}s" "${hv:-?}"
+    printf '  %-24s %-10s %-10s %-6s %s\n' "$h" "${c}s" "${a}s" "${hv:-?}" "$t13"
+    case "${hv:-?}:$t13" in
+      2*:✓) [ -z "$best" ] && best="$h" ;;
+    esac
   done
   hr
-  dim "选 TCP 连接最低、HTTP 为 2、且不在 GFW 名单的站点填入 reality.handshake.server"
+  [ -n "$best" ] && ok "首选（HTTP/2 + TLS1.3 且排在前面的）：$best"
+  dim "换法：sbopt setdest <域名>"
+  dim "注意：别选被墙域名，也别选与你落地机同机房/同 CDN 回源过近的站"
   echo
 }
 
@@ -1341,6 +1367,62 @@ cmd_update() {
   echo
 }
 
+# --------------------------------------------- 12. 更换 REALITY 伪装站 --------
+cmd_setdest() {
+  local host="${1:-}"
+  hr; say "更换 REALITY 伪装站"; hr
+  if [ -z "$host" ]; then
+    dim "用法：sbopt setdest <域名>"
+    dim "先用 sbopt dest 测速，再指定；实测推荐 www.cloudflare.com / one.one.one.one"
+    return 1
+  fi
+
+  detect_cfg || { err "未找到配置"; return 1; }
+  detect_svc
+  ensure_jq || return 1
+  build_index || { err "没有可解析的入站"; return 1; }
+
+  req_pkg curl
+  local probe
+  probe=$(curl -sI -o /dev/null --max-time 8 --tlsv1.3 "https://$host" 2>/dev/null && echo ok13)
+  if [ -n "${probe:-}" ]; then
+    ok "$host 可达，支持 TLS1.3"
+  elif curl -sI -o /dev/null --max-time 8 "https://$host" >/dev/null 2>&1; then
+    warn "$host 可达，但 TLS1.3 探测失败（可能被中间设备干扰），REALITY 建议 TLS1.3"
+  else
+    err "$host 从本机不可达，不能作为伪装站"
+    dim "换一个站点：sbopt dest 会列出可用候选"
+    return 1
+  fi
+
+  local e f i tag type changed=0
+  for e in "${IDX[@]}"; do
+    f=$(printf '%s' "$e" | cut -d'|' -f1)
+    i=$(printf '%s' "$e" | cut -d'|' -f2)
+    tag=$(printf '%s' "$e" | cut -d'|' -f3)
+    type=$(printf '%s' "$e" | cut -d'|' -f4)
+    [ "$type" = "vless" ] || continue
+    qjq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
+
+    hr; printf '  [%s] 当前：%s\n' "$tag" \
+      "$(qjq -r ".inbounds[$i].tls.reality.handshake.server // .inbounds[$i].tls.server_name // \"-\"" "$f")"
+    if ask "把 handshake.server 与 server_name 都改成 $host ?"; then
+      apply_file "$f" "REALITY[$tag] dest -> $host" \
+        --arg h "$host" \
+        ".inbounds[$i].tls.reality.handshake.server = \$h | .inbounds[$i].tls.server_name = \$h" \
+        && changed=$((changed+1))
+    fi
+  done
+
+  if [ "$changed" -gt 0 ]; then
+    echo
+    warn "客户端 SNI 已改变，旧链接会失效 -> 执行 sbopt links 重新导入"
+  else
+    dim "未做修改"
+  fi
+  echo
+}
+
 # ------------------------------------------- 10.5 JSONC 规范化（修复 jq） ----
 cmd_fixjson() {
   hr; say "JSONC 规范化"; hr
@@ -1494,6 +1576,7 @@ ${c_b}
     9) 诊断          配置探测失败时用，输出各来源原始结果
    10) 文件检查      逐个校验配置 JSON 与入站端口，抓漏读
    11) 规范化 JSONC  把带注释的配置文件转成严格 JSON（jq 可读）
+   12) 换伪装站      把 REALITY 的 handshake/SNI 换成指定域名
     0) 退出
 ${c_d}
   提示：体检报「未找到配置」时，先跑 9
@@ -1513,6 +1596,7 @@ EOF
       9) cmd_doctor ;;
       10) cmd_files ;;
       11) cmd_fixjson ;;
+      12) shift 2>/dev/null; read -rp "  伪装站域名: " _h </dev/tty; cmd_setdest "$_h" ;;
       0|q) exit 0 ;;
       *) ;;
     esac
@@ -1559,6 +1643,7 @@ case "${1:-}" in
   rollback) cmd_rollback ;;
   files)    cmd_files ;;
   fixjson)  cmd_fixjson ;;
+  setdest)  shift; cmd_setdest "${1:-}" ;;
   update)   cmd_update ;;
   version|-v) self_version "${BASH_SOURCE[0]}" ;;
   menu|"")  menu ;;
