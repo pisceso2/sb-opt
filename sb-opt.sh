@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.4.0
+# VERSION 1.4.1
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -398,6 +398,15 @@ readable_file() {
   return 1
 }
 
+# 与 jq 用法一致，但文件参数支持 JSONC：内部自动换成规范化副本
+qjq() {
+  local n=$# file="${!#}" rf
+  [ "$n" -ge 2 ] || { jq "$@"; return $?; }
+  local -a args=("${@:1:$((n-1))}")
+  rf=$(readable_file "$file") || return 2
+  jq "${args[@]}" "$rf"
+}
+
 SKIPPED_FILES=()
 build_index() {
   IDX=(); SKIPPED_FILES=()
@@ -563,7 +572,7 @@ check_cfg() {   # 校验 CFG（单文件或目录）；$1 可选=替换后的临
     stage=$(mktemp -d)
     cp -a "$CFG"/. "$stage"/ 2>/dev/null
     [ -n "${1:-}" ] && cp "$1" "$stage/$(basename "$TARGET_FILE")"
-    out=$("$SB_BIN" check -c "$stage" 2>&1); rc=$?
+    out=$("$SB_BIN" check -C "$stage" 2>&1); rc=$?
     rm -rf "$stage"
   else
     out=$("$SB_BIN" check -c "${1:-$CFG}" 2>&1); rc=$?
@@ -589,10 +598,15 @@ restart_svc() {
 # apply_file <文件> <说明> [jq选项...] <jq表达式>
 apply_file() {
   local f="$1" desc="$2"; shift 2
-  local tmp
+  local tmp rf
   TARGET_FILE="$f"
+  if ! rf=$(readable_file "$f"); then
+    err "$desc：$(basename "$f") 无法解析（JSONC 规范化也失败）"
+    return 1
+  fi
+  [ "$rf" != "$f" ] && { warn "$(basename "$f") 含注释/尾逗号，写回后会变成严格 JSON"; }
   tmp=$(mktemp "/tmp/sbcfg.XXXXXX.json")
-  if ! jq "$@" "$f" >"$tmp" 2>"$BASE/jq.err"; then
+  if ! jq "$@" "$rf" >"$tmp" 2>"$BASE/jq.err"; then
     err "$desc：jq 处理失败"; sed 's/^/       /' "$BASE/jq.err" >&2; rm -f "$tmp"; return 1
   fi
   if ! check_cfg "$tmp"; then
@@ -797,9 +811,9 @@ cmd_audit() {
     local f2 i2
     f2=$(printf '%s' "$e2" | cut -d'|' -f1)
     i2=$(printf '%s' "$e2" | cut -d'|' -f2)
-    jq -e ".inbounds[$i2].type==\"vless\" and .inbounds[$i2].tls.reality.enabled==true and (.inbounds[$i2].tls.utls.fingerprint//\"\")!=\"chrome\"" "$f2" >/dev/null 2>&1 \
+    qjq -e ".inbounds[$i2].type==\"vless\" and .inbounds[$i2].tls.reality.enabled==true and (.inbounds[$i2].tls.utls.fingerprint//\"\")!=\"chrome\"" "$f2" >/dev/null 2>&1 \
       && dim "· REALITY 未设 utls=chrome -> 执行 tune"
-    jq -e ".inbounds[$i2].type==\"hysteria2\" and (.inbounds[$i2].obfs.type//\"\")==\"\"" "$f2" >/dev/null 2>&1 \
+    qjq -e ".inbounds[$i2].type==\"hysteria2\" and (.inbounds[$i2].obfs.type//\"\")==\"\"" "$f2" >/dev/null 2>&1 \
       && dim "· Hysteria2 未加 obfs，UDP 易被 QoS -> 执行 tune"
   done
   [ "$n" -eq 0 ] && dim "· 没有可用入站信息 -> 执行 doctor"
@@ -919,11 +933,11 @@ cmd_tune() {
     tag=$(printf '%s' "$e" | cut -d'|' -f3)
     type=$(printf '%s' "$e" | cut -d'|' -f4)
     [ "$type" = "vless" ] || continue
-    jq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
+    qjq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
 
     local fp hs
-    fp=$(jq -r ".inbounds[$i].tls.utls.fingerprint // \"\"" "$f")
-    hs=$(jq -r ".inbounds[$i].tls.reality.handshake.server // .inbounds[$i].tls.server_name // \"-\"" "$f")
+    fp=$(qjq -r ".inbounds[$i].tls.utls.fingerprint // \"\"" "$f")
+    hs=$(qjq -r ".inbounds[$i].tls.reality.handshake.server // .inbounds[$i].tls.server_name // \"-\"" "$f")
 
     hr; printf '  REALITY 入站 [%s]  (%s)\n' "$tag" "$(basename "$f")"
     printf '    伪装站 : %s\n' "$hs"
@@ -948,10 +962,10 @@ cmd_tune() {
     [ "$type" = "hysteria2" ] || continue
 
     local port obfs up down
-    port=$(jq -r ".inbounds[$i].listen_port // \"-\"" "$f")
-    obfs=$(jq -r ".inbounds[$i].obfs.type // \"\"" "$f")
-    up=$(jq -r ".inbounds[$i].up_mbps // \"未设\"" "$f")
-    down=$(jq -r ".inbounds[$i].down_mbps // \"未设\"" "$f")
+    port=$(qjq -r ".inbounds[$i].listen_port // \"-\"" "$f")
+    obfs=$(qjq -r ".inbounds[$i].obfs.type // \"\"" "$f")
+    up=$(qjq -r ".inbounds[$i].up_mbps // \"未设\"" "$f")
+    down=$(qjq -r ".inbounds[$i].down_mbps // \"未设\"" "$f")
 
     hr; printf '  Hysteria2 入站 [%s]  (%s)\n' "$tag" "$(basename "$f")"
     printf '    端口   : %s' "$port"
@@ -1062,13 +1076,13 @@ cmd_links() {
 
     case "$type" in
       vless)
-        jq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
+        qjq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
         local uuid sni sid priv pub flow
-        uuid=$(jq -r ".inbounds[$i].users[0].uuid // empty" "$f")
-        sni=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
-        sid=$(jq -r ".inbounds[$i].tls.reality.short_id[0] // empty" "$f")
-        priv=$(jq -r ".inbounds[$i].tls.reality.private_key // empty" "$f")
-        flow=$(jq -r ".inbounds[$i].users[0].flow // \"xtls-rprx-vision\"" "$f")
+        uuid=$(qjq -r ".inbounds[$i].users[0].uuid // empty" "$f")
+        sni=$(qjq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        sid=$(qjq -r ".inbounds[$i].tls.reality.short_id[0] // empty" "$f")
+        priv=$(qjq -r ".inbounds[$i].tls.reality.private_key // empty" "$f")
+        flow=$(qjq -r ".inbounds[$i].users[0].flow // \"xtls-rprx-vision\"" "$f")
         pub=$(pubkey_from_priv "$priv" 2>/dev/null || true)
         [ -z "${pub:-}" ] && { warn "无法自动推导 REALITY 公钥，请用 sing-box generate reality-keypair 重配"; pub="<公钥>"; }
         hr; printf '  [%s] VLESS-REALITY\n' "$tag"
@@ -1077,10 +1091,10 @@ cmd_links() {
         ;;
       hysteria2)
         local pw sni2 obfst obfsp extra=""
-        pw=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
-        sni2=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
-        obfst=$(jq -r ".inbounds[$i].obfs.type // empty" "$f")
-        obfsp=$(jq -r ".inbounds[$i].obfs.password // empty" "$f")
+        pw=$(qjq -r ".inbounds[$i].users[0].password // empty" "$f")
+        sni2=$(qjq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        obfst=$(qjq -r ".inbounds[$i].obfs.type // empty" "$f")
+        obfsp=$(qjq -r ".inbounds[$i].obfs.password // empty" "$f")
         [ -n "$obfst" ] && extra="&obfs=${obfst}&obfs-password=${obfsp}"
         hr; printf '  [%s] Hysteria2\n' "$tag"
         printf '  hysteria2://%s@%s:%s?sni=%s&insecure=1%s#%s-HY2\n' \
@@ -1089,31 +1103,31 @@ cmd_links() {
         ;;
       trojan)
         local tpw tsni
-        tpw=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
-        tsni=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        tpw=$(qjq -r ".inbounds[$i].users[0].password // empty" "$f")
+        tsni=$(qjq -r ".inbounds[$i].tls.server_name // empty" "$f")
         hr; printf '  [%s] Trojan\n' "$tag"
         printf '  trojan://%s@%s:%s?sni=%s&allowInsecure=1#%s\n' "$tpw" "$ip" "$port" "$tsni" "$tag"
         ;;
       tuic)
         local tuuid tpw2 tsni2
-        tuuid=$(jq -r ".inbounds[$i].users[0].uuid // empty" "$f")
-        tpw2=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
-        tsni2=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        tuuid=$(qjq -r ".inbounds[$i].users[0].uuid // empty" "$f")
+        tpw2=$(qjq -r ".inbounds[$i].users[0].password // empty" "$f")
+        tsni2=$(qjq -r ".inbounds[$i].tls.server_name // empty" "$f")
         hr; printf '  [%s] TUIC v5\n' "$tag"
         printf '  tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=bbr&allow_insecure=1#%s\n' \
           "$tuuid" "$tpw2" "$ip" "$port" "$tsni2" "$tag"
         ;;
       anytls)
         local apw asni
-        apw=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
-        asni=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        apw=$(qjq -r ".inbounds[$i].users[0].password // empty" "$f")
+        asni=$(qjq -r ".inbounds[$i].tls.server_name // empty" "$f")
         hr; printf '  [%s] AnyTLS\n' "$tag"
         printf '  anytls://%s@%s:%s?sni=%s&insecure=1#%s\n' "$apw" "$ip" "$port" "$asni" "$tag"
         ;;
       shadowsocks)
         local sm sp
-        sm=$(jq -r ".inbounds[$i].method // empty" "$f")
-        sp=$(jq -r ".inbounds[$i].password // empty" "$f")
+        sm=$(qjq -r ".inbounds[$i].method // empty" "$f")
+        sp=$(qjq -r ".inbounds[$i].password // empty" "$f")
         if [ -n "$sm" ] && [ -n "$sp" ]; then
           local b64
           b64=$(printf '%s' "$sm:$sp" | base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '=')
@@ -1140,7 +1154,7 @@ cmd_port() {
   loc=$(locate_inbound "$key") || { err "找不到 tag/type 为 $key 的入站"; return 1; }
   f=$(printf '%s' "$loc" | cut -d'|' -f1)
   i=$(printf '%s' "$loc" | cut -d'|' -f2)
-  type=$(jq -r ".inbounds[$i].type" "$f")
+  type=$(qjq -r ".inbounds[$i].type" "$f")
 
   apply_file "$f" "$key 端口 -> $port" \
     --arg p "$port" "(.inbounds[$i].listen_port) |= (\$p|tonumber)" || return 1
@@ -1166,12 +1180,12 @@ cmd_disable() {
   loc=$(locate_inbound "$key") || { err "找不到 tag/type 为 $key 的入站"; return 1; }
   f=$(printf '%s' "$loc" | cut -d'|' -f1)
   i=$(printf '%s' "$loc" | cut -d'|' -f2)
-  tag=$(jq -r ".inbounds[$i].tag // \"$key\"" "$f")
+  tag=$(qjq -r ".inbounds[$i].tag // \"$key\"" "$f")
 
   mkdir -p "$DIS"
   local safe
   safe=$(printf '%s' "$tag" | tr '/ ' '__')
-  jq ".inbounds[$i]" "$f" >"$DIS/$safe.json"
+  qjq ".inbounds[$i]" "$f" >"$DIS/$safe.json"
   apply_file "$f" "停用入站 [$tag]" "del(.inbounds[$i])" \
     && ok "入站定义已存入 $DIS/$safe.json（可用 enable 恢复）"
 }
@@ -1324,7 +1338,7 @@ cmd_fixjson() {
   fi
 
   if detect_bin; then
-    out=$("$SB_BIN" check -c "$stage" 2>&1); rc=$?
+    out=$("$SB_BIN" check -C "$stage" 2>&1); rc=$?
     if [ "$rc" -ne 0 ]; then
       err "规范化后的配置未通过 sing-box check，已放弃（原文件未改动）"
       printf '%s\n' "$out" | head -8 | sed 's/^/       /'
@@ -1384,7 +1398,7 @@ cmd_files() {
     err1=$(jq -e . "$f" 2>&1 >/dev/null | head -1)
     if [ -z "$err1" ]; then
       st="OK"
-      types=$(jq -r '[.inbounds[]? | "\(.type):\(.listen_port // "-")"] | join(", ")' "$f" 2>/dev/null)
+      types=$(qjq -r '[.inbounds[]? | "\(.type):\(.listen_port // "-")"] | join(", ")' "$f" 2>/dev/null)
       [ -z "$types" ] && types="（无 inbounds）"
       printf '  %-40s %8s  %-9s %s\n' "$(basename "$f")" "$size" "$st" "$types"
     else
