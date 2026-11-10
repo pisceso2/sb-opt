@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.1.1
+# VERSION 1.2.0
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -331,18 +331,49 @@ build_index() {
 }
 
 # 按 tag 或 type 查找索引项，输出 "文件|下标"
+_idx_emit() { printf '%s|%s\n' "$(printf '%s' "$1" | cut -d'|' -f1)" \
+                                "$(printf '%s' "$1" | cut -d'|' -f2)"; }
+
+# 协议别名：hy2 -> hysteria2 等
+_type_alias() {
+  case "$1" in
+    hy2|hysteria|h2|hysteria2) echo hysteria2 ;;
+    ss|shadowsocks)            echo shadowsocks ;;
+    stls|shadow-tls)           echo shadowtls ;;
+    *)                         echo "$1" ;;
+  esac
+}
+
+# 定位入站：支持 序号(#1) / tag 精确 / tag 包含 / type / type 别名
 locate_inbound() {
-  local key="$1" e tag type
+  local key="$1" e tag type k alias
+
+  # 1) 纯数字 = audit 里的序号（1 起）
+  if [[ "$key" =~ ^#?[0-9]+$ ]]; then
+    k=$(printf '%s' "${key#\#}")
+    if [ "$k" -ge 1 ] && [ "$k" -le "${#IDX[@]}" ]; then
+      _idx_emit "${IDX[$((k-1))]}"; return 0
+    fi
+    return 1
+  fi
+
+  # 2) tag 精确
   for e in "${IDX[@]}"; do
     tag=$(printf '%s' "$e" | cut -d'|' -f3)
-    type=$(printf '%s' "$e" | cut -d'|' -f4)
-    [ "$tag" = "$key" ] && { printf '%s|%s\n' "$(printf '%s' "$e" | cut -d'|' -f1)" \
-                                                   "$(printf '%s' "$e" | cut -d'|' -f2)"; return 0; }
+    [ "$tag" = "$key" ] && { _idx_emit "$e"; return 0; }
   done
+
+  # 3) tag 包含（忽略大小写），适配 "🇭🇰 xxx tuic" 这种长 tag
+  for e in "${IDX[@]}"; do
+    tag=$(printf '%s' "$e" | cut -d'|' -f3)
+    case "${tag,,}" in *"${key,,}"*) _idx_emit "$e"; return 0 ;; esac
+  done
+
+  # 4) type 精确 / 别名
+  alias=$(_type_alias "$key")
   for e in "${IDX[@]}"; do
     type=$(printf '%s' "$e" | cut -d'|' -f4)
-    [ "$type" = "$key" ] && { printf '%s|%s\n' "$(printf '%s' "$e" | cut -d'|' -f1)" \
-                                                   "$(printf '%s' "$e" | cut -d'|' -f2)"; return 0; }
+    [ "$type" = "$alias" ] && { _idx_emit "$e"; return 0; }
   done
   return 1
 }
@@ -363,6 +394,23 @@ backup_file() {
 
 detect_bin() {
   [ -n "$SB_BIN" ] && return 0
+  local pid exe
+  # 1) 运行中进程的真实可执行文件（/proc/<pid>/exe），最可靠
+  for pid in $(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null); do
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
+    exe=${exe% (deleted)}
+    case "$exe" in
+      *sing-box*|*xray*) [ -x "$exe" ] && { SB_BIN="$exe"; return 0; } ;;
+    esac
+  done
+  # 2) 进程 argv[0]
+  for pid in $(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null); do
+    exe=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -1)
+    case "$exe" in
+      /*) [ -x "$exe" ] && { SB_BIN="$exe"; return 0; } ;;
+    esac
+  done
+  # 3) PATH 与常见安装位置
   local p
   for p in sing-box xray /usr/local/bin/sing-box /usr/bin/sing-box \
            /etc/v2ray-agent/sing-box/sing-box /etc/v2ray-agent/xray/xray \
@@ -540,11 +588,48 @@ cmd_audit() {
   done
 
   local n=${#IDX[@]}
-  [ "$n" -gt 2 ] && { hr; warn "当前有 $n 个入站，建议只保留 2 个（REALITY + Hysteria2）"; \
-                      dim "多开不提升速度，只增加暴露面、CPU 与排查难度"; }
+  if [ "$n" -gt 2 ]; then
+    hr; warn "当前有 $n 个入站，建议只保留 2 个"
+    local has_reality=0 has_quic=0
+    local ee tt
+    for ee in "${IDX[@]}"; do
+      tt=$(printf '%s' "$ee" | cut -d'|' -f4)
+      [ "$tt" = "vless" ] && has_reality=1
+      case "$tt" in hysteria2|tuic) has_quic=1 ;; esac
+    done
+    if [ "$has_reality" = 1 ]; then
+      dim "推荐组合：VLESS-REALITY（TCP 主力）+ Hysteria2（晚高峰抗丢包）"
+    elif [ "$has_quic" = 1 ]; then
+      dim "推荐组合：一个 QUIC（hysteria2 或 tuic 只留其一）+ 一个 TCP-TLS（trojan 或 anytls 只留其一）"
+      dim "同时开 hy2 与 tuic 会互相抢 UDP 配额，且更容易被 QoS 针对"
+    else
+      dim "推荐组合：一个 TCP-TLS（trojan 或 anytls 只留其一）+ 一个 QUIC（可选）"
+    fi
+    dim "多开不提升速度，只增加暴露面、CPU 与排查难度"
+  fi
 
   hr; say "端口监听"; hr
   ss -lntup 2>/dev/null | grep -E 'sing-box|xray' | awk '{print "  "$1"  "$5"  "$7}' || echo "  （无）"
+
+  # 对账：对外监听端口 vs 配置里声明的端口，抓「配置没读全」
+  local -a declared=()
+  local pe pp
+  for pe in "${IDX[@]}"; do
+    pp=$(printf '%s' "$pe" | cut -d'|' -f5)
+    [ "$pp" != "-" ] && declared+=("$pp")
+  done
+  local -a unknown=()
+  while read -r pp; do
+    [ -n "$pp" ] || continue
+    case " ${declared[*]} " in *" $pp "*) ;; *) unknown+=("$pp") ;; esac
+  done < <(ss -lntup 2>/dev/null | grep -E 'sing-box|xray' \
+             | awk '$5 !~ /^127\.0\.0\.1:/ && $5 !~ /^\[::1\]:/ {n=split($5,a,":"); print a[n]}' \
+             | sort -un)
+
+  if [ ${#unknown[@]} -gt 0 ]; then
+    hr; warn "有 ${#unknown[@]} 个对外端口在配置里找不到对应入站：${unknown[*]}"
+    dim "说明配置没读全（可能有多份配置文件），请跑：sbopt doctor"
+  fi
 
   hr; say "防火墙"; hr
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -857,6 +942,40 @@ cmd_links() {
         printf '  hysteria2://%s@%s:%s?sni=%s&insecure=1%s#%s-HY2\n' \
           "$pw" "$ip" "$port" "$sni2" "$extra" "$tag"
         dim "自签证书用 insecure=1；正式证书请删掉该参数"
+        ;;
+      trojan)
+        local tpw tsni
+        tpw=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
+        tsni=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        hr; printf '  [%s] Trojan\n' "$tag"
+        printf '  trojan://%s@%s:%s?sni=%s&allowInsecure=1#%s\n' "$tpw" "$ip" "$port" "$tsni" "$tag"
+        ;;
+      tuic)
+        local tuuid tpw2 tsni2
+        tuuid=$(jq -r ".inbounds[$i].users[0].uuid // empty" "$f")
+        tpw2=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
+        tsni2=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        hr; printf '  [%s] TUIC v5\n' "$tag"
+        printf '  tuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=bbr&allow_insecure=1#%s\n' \
+          "$tuuid" "$tpw2" "$ip" "$port" "$tsni2" "$tag"
+        ;;
+      anytls)
+        local apw asni
+        apw=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
+        asni=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        hr; printf '  [%s] AnyTLS\n' "$tag"
+        printf '  anytls://%s@%s:%s?sni=%s&insecure=1#%s\n' "$apw" "$ip" "$port" "$asni" "$tag"
+        ;;
+      shadowsocks)
+        local sm sp
+        sm=$(jq -r ".inbounds[$i].method // empty" "$f")
+        sp=$(jq -r ".inbounds[$i].password // empty" "$f")
+        if [ -n "$sm" ] && [ -n "$sp" ]; then
+          local b64
+          b64=$(printf '%s' "$sm:$sp" | base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '=')
+          hr; printf '  [%s] Shadowsocks\n' "$tag"
+          printf '  ss://%s@%s:%s#%s\n' "$b64" "$ip" "$port" "$tag"
+        fi
         ;;
     esac
   done
