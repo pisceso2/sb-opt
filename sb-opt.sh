@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.2.0
+# VERSION 1.3.0
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -179,6 +179,9 @@ _p_known() {
     /opt/sing-box/config.json \
     /root/sing-box/config.json \
     /etc/sing-box/conf/config.json \
+    /etc/sing-box/conf \
+    /etc/sing-box \
+    /usr/local/etc/sing-box/conf \
     /etc/v2ray-agent/sing-box/conf/config \
     /etc/v2ray-agent/sing-box/conf \
     /usr/local/etc/v2ray-agent/sing-box/conf/config \
@@ -291,19 +294,44 @@ detect_cfg() {
   return 1
 }
 
+# 服务名必须真的是代理核心，禁止把 argo/nginx 之类当成 sing-box 重启
+_svc_safe() {
+  case "$1" in
+    sing-box|singbox|sing-box-server|xray|v2ray|mihomo|hysteria|hysteria-server) return 0 ;;
+    *sing-box*|*singbox*|*xray*|*hysteria*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 detect_svc() {
   [ -n "$SVC" ] && return 0
-  local u
+  local u out
+
+  # 1) 直接探测候选单元是否存在（systemctl cat 不受颜色/分页影响）
   for u in sing-box singbox sing-box-server xray v2ray mihomo hysteria-server hysteria; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${u}\.service"; then
+    if systemctl cat "${u}.service" >/dev/null 2>&1; then
       SVC="$u"; return 0
     fi
   done
-  # 退一步：从进程反推服务名
-  local pid
-  for pid in $(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null | head -1); do
-    systemctl status "$pid" 2>/dev/null | head -1 | grep -oE '[a-zA-Z0-9_.-]+\.service' \
-      && { SVC=$(systemctl status "$pid" 2>/dev/null | head -1 | grep -oE '[a-zA-Z0-9_.-]+\.service' | sed 's/\.service$//'); return 0; }
+
+  # 2) 在所有 unit 里找 ExecStart 提到 sing-box/xray 的那个
+  for u in $(systemctl list-unit-files --no-legend --no-pager 2>/dev/null \
+             | sed 's/\x1b\[[0-9;]*m//g' | awk '{print $1}' | grep -E '\.service$'); do
+    out=$(systemctl show -p ExecStart --value "$u" 2>/dev/null)
+    case "$out" in
+      *sing-box*|*xray*) _svc_safe "${u%.service}" && { SVC="${u%.service}"; return 0; } ;;
+    esac
+  done
+
+  # 3) 从进程反推（只接受名字像代理服务的单元）
+  local pid name
+  for pid in $(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null | head -3); do
+    name=$(systemctl status "$pid" 2>/dev/null | head -1 \
+           | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '[a-zA-Z0-9_.-]+\.service' | head -1)
+    [ -n "${name:-}" ] || continue
+    if _svc_safe "${name%.service}"; then
+      SVC="${name%.service}"; return 0
+    fi
   done
   return 1
 }
@@ -319,14 +347,26 @@ cfg_files() {
 
 # ==================================================== 入站索引（文件+下标） ==
 declare -a IDX=()   # 每项 "文件|下标|tag|type|端口"
+SKIPPED_FILES=()
 build_index() {
-  IDX=()
+  IDX=(); SKIPPED_FILES=()
   jqok || return 1
   local f n i tag type port
   while IFS= read -r f; do
     [ -f "$f" ] || continue
-    jq -e '.inbounds' "$f" >/dev/null 2>&1 || continue
+    if ! jq -e '.inbounds' "$f" >/dev/null 2>&1; then
+      case "$(basename "$f")" in
+        *inbound*|*inb*) SKIPPED_FILES+=("$(basename "$f")") ;;
+      esac
+      continue
+    fi
     n=$(jq '.inbounds | length' "$f" 2>/dev/null) || continue
+    if [ "$n" -eq 0 ]; then
+      case "$(basename "$f")" in
+        *inbound*|*inb*) SKIPPED_FILES+=("$(basename "$f")（inbounds 为空）") ;;
+      esac
+      continue
+    fi
     for ((i=0; i<n; i++)); do
       tag=$(jq -r ".inbounds[$i].tag // \"-\"" "$f")
       type=$(jq -r ".inbounds[$i].type // \"-\"" "$f")
@@ -399,27 +439,54 @@ backup_file() {
   log "backup $f -> $b ($desc)"
 }
 
+_is_proxy_bin() {
+  case "$(basename "${1:-}")" in
+    sing-box|xray|sing-box-real) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 detect_bin() {
   [ -n "$SB_BIN" ] && return 0
-  local pid exe
-  # 1) 运行中进程的真实可执行文件（/proc/<pid>/exe），最可靠
+  local pid exe cwd
+
+  # 1) 运行中进程的真实可执行文件（/proc/<pid>/exe）——最可靠
   for pid in $(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null); do
-    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
     exe=${exe% (deleted)}
-    case "$exe" in
-      *sing-box*|*xray*) [ -x "$exe" ] && { SB_BIN="$exe"; return 0; } ;;
-    esac
+    _is_proxy_bin "$exe" || continue
+    if [ -x "$exe" ]; then SB_BIN="$exe"; return 0; fi
+    # 二进制被替换/删除：记住路径，但校验会失败，交给下面的搜索
+    [ -n "${_SB_BIN_HINT:-}" ] || _SB_BIN_HINT="$exe"
   done
-  # 2) 进程 argv[0]
+
+  # 2) 进程 argv[0]（支持相对路径，用 /proc/<pid>/cwd 还原）
   for pid in $(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null); do
     exe=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -1)
     case "$exe" in
-      /*) [ -x "$exe" ] && { SB_BIN="$exe"; return 0; } ;;
+      /*) : ;;
+      */*) cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null); exe="${cwd}/${exe}" ;;
+      *) continue ;;
     esac
+    _is_proxy_bin "$exe" || continue
+    [ -x "$exe" ] && { SB_BIN="$exe"; return 0; }
   done
-  # 3) PATH 与常见安装位置
+
+  # 3) systemd 单元 ExecStart 的第一个 token
+  local u first
+  if detect_svc; then
+    first=$(systemctl show -p ExecStart --value "${SVC}.service" 2>/dev/null \
+            | tr ';' '\n' | sed -n 's/^ *path=\([^ ;]*\).*/\1/p' | head -1)
+    if [ -n "${first:-}" ] && _is_proxy_bin "$first" && [ -x "$first" ]; then
+      SB_BIN="$first"; return 0
+    fi
+  fi
+
+  # 4) PATH 与常见安装位置
   local p
-  for p in sing-box xray /usr/local/bin/sing-box /usr/bin/sing-box \
+  for p in sing-box xray \
+           /usr/local/bin/sing-box /usr/bin/sing-box /etc/sing-box/sing-box \
+           /etc/sing-box/bin/sing-box /etc/sing-box/argo/sing-box \
            /etc/v2ray-agent/sing-box/sing-box /etc/v2ray-agent/xray/xray \
            /opt/sing-box/sing-box /usr/local/bin/xray /usr/bin/xray; do
     case "$p" in
@@ -427,6 +494,12 @@ detect_bin() {
       *)  command -v "$p" >/dev/null 2>&1 && { SB_BIN=$(command -v "$p"); return 0; } ;;
     esac
   done
+
+  # 5) 受限 find 兜底
+  exe=$(find /etc /usr/local /opt /root -maxdepth 4 -type f \
+        \( -name 'sing-box' -o -name 'xray' \) -perm -u+x 2>/dev/null | head -1)
+  [ -n "${exe:-}" ] && [ -x "$exe" ] && { SB_BIN="$exe"; return 0; }
+
   return 1
 }
 
@@ -454,6 +527,7 @@ restart_svc() {
     return 1
   fi
   [ -n "$SVC" ] || return 1
+  _svc_safe "$SVC" || { err "拒绝重启非代理服务：$SVC（请先确认服务名）"; return 1; }
   systemctl restart "$SVC" >/dev/null 2>&1
   sleep 2
   systemctl is-active --quiet "$SVC"
@@ -593,6 +667,11 @@ cmd_audit() {
     esac
     printf '  %-3s %-16s %-12s %-7s %s\n' "$k" "$tag" "$type" "$port" "$note"
   done
+
+  if [ ${#SKIPPED_FILES[@]} -gt 0 ]; then
+    hr; warn "以下 inbound 配置文件没能解析出 .inbounds，已被跳过："
+    printf '       %s\n' "${SKIPPED_FILES[@]}"
+  fi
 
   local n=${#IDX[@]}
   if [ "$n" -gt 2 ]; then
