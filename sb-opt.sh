@@ -41,6 +41,13 @@ DIS="$BASE/disabled"
 LOGF="$BASE/sb-opt.log"
 SYSCTL_FILE="/etc/sysctl.d/99-sb-opt.conf"
 REPO_RAW="https://raw.githubusercontent.com/pisceso2/sb-opt/main"
+# 下载源（按顺序尝试）：国内网络下 raw.githubusercontent 常被挡
+MIRRORS=(
+  "$REPO_RAW"
+  "https://cdn.jsdelivr.net/gh/pisceso2/sb-opt@main"
+  "https://raw.gitmirror.com/pisceso2/sb-opt/main"
+  "https://ghfast.top/https://raw.githubusercontent.com/pisceso2/sb-opt/main"
+)
 
 CFG=""          # 配置文件，或（多文件模式）配置目录
 CFG_MULTI=0     # 1 = 目录多文件
@@ -1106,8 +1113,17 @@ cmd_update() {
   self=$(readlink -f "$0" 2>/dev/null || echo "$0")
   tmp=$(mktemp /tmp/sbopt.XXXXXX)
 
-  if ! curl -fsSL --max-time 30 "$REPO_RAW/sb-opt.sh" -o "$tmp"; then
-    err "下载失败，请检查网络或仓库是否公开"; rm -f "$tmp"; return 1
+  local got=0 m
+  for m in "${MIRRORS[@]}"; do
+    dim "尝试 $m"
+    if curl -fsSL --max-time 25 "$m/sb-opt.sh" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      got=1; ok "下载成功：$m"; break
+    fi
+  done
+  if [ "$got" = 0 ]; then
+    err "所有下载源都失败（raw / jsdelivr / gitmirror / ghfast）"
+    dim "请检查服务器出网，或稍后重试；也可手工下载后覆盖 /root/sb-opt/sb-opt.sh"
+    rm -f "$tmp"; return 1
   fi
   if ! bash -n "$tmp" 2>/dev/null; then
     err "下载的版本语法校验失败，已放弃"; rm -f "$tmp"; return 1
