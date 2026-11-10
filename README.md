@@ -25,8 +25,8 @@ sbopt
 | 功能 | 说明 |
 |---|---|
 | **体检** | 内核 / BBR / 内存 / swap / 入站清单 / 端口 / 防火墙 / 流量，一眼看清现状 |
-| **系统优化** | BBR + fq + sysctl 调优 + 1G swap + 文件句柄 1048576（收益最大的一步） |
-| **配置调参** | REALITY 补 `utls: chrome`、Hysteria2 加 `obfs.salamander`、UDP/443 挪到 24443 |
+| **系统优化** | BBR + fq（含 `tc` 替换已有网卡队列）+ sysctl 调优 + 1G swap + 文件句柄 1048576 |
+| **配置调参** | Hysteria2 加 `obfs.salamander`、UDP/443 挪到 24443；REALITY 只做检查（uTLS 指纹是客户端参数，服务端没有该字段） |
 | **伪装站测速** | 实测 8 个候选站的 TCP/TLS 握手延迟，挑最快的填 `reality.handshake.server` |
 | **生成链接** | 输出 `vless://`、`hysteria2://`、`trojan://`、`tuic://`、`anytls://`、`ss://`，直接粘贴进 v2rayN |
 | **启停入站** | `disable <tag>` 精简掉 TUIC / Argo，`enable <tag>` 随时恢复 |
