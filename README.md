@@ -106,6 +106,16 @@ tail -1 /root/sb-opt/sb-opt.sh            # 应看到 __END_SBOPT__
 
 ---
 
+## 下载源
+
+`install.sh` 与 `sbopt update` 会**依次尝试 4 个源**，前一个不通自动换下一个：
+
+```
+raw.githubusercontent.com  →  cdn.jsdelivr.net/gh  →  raw.gitmirror.com  →  ghfast.top 加速
+```
+
+国内机器上 `raw.githubusercontent.com` 经常不可达，脚本会自动落到 jsdelivr，不需要你手动改。
+
 ## 升级
 
 三种方式任选：
