@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.3.1
+# VERSION 1.4.0
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -347,20 +347,72 @@ cfg_files() {
 
 # ==================================================== 入站索引（文件+下标） ==
 declare -a IDX=()   # 每项 "文件|下标|tag|type|端口"
+# ------------------------------------------------- JSONC（带注释）兼容 ------
+# sing-box 用 jsonc 兼容解析器，允许 // 注释、/* */ 注释与尾逗号；
+# jq 只吃严格 JSON，所以带注释的文件会被 jq 判为非法。
+declare -A CLEAN=()
+
+_sanitize_jsonc() {   # $1 源文件  $2 输出文件
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$1" "$2" <<'PYEOF'
+import sys, re
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src, 'rb').read().decode('utf-8-sig', 'replace')
+out = []; i = 0; n = len(s); instr = False; esc = False
+while i < n:
+    c = s[i]
+    if instr:
+        out.append(c)
+        if esc: esc = False
+        elif c == '\\': esc = True
+        elif c == '"': instr = False
+        i += 1; continue
+    if c == '"':
+        instr = True; out.append(c); i += 1; continue
+    if c == '/' and i + 1 < n and s[i+1] == '/':
+        while i < n and s[i] not in '\r\n': i += 1
+        continue
+    if c == '/' and i + 1 < n and s[i+1] == '*':
+        i += 2
+        while i + 1 < n and not (s[i] == '*' and s[i+1] == '/'): i += 1
+        i += 2; continue
+    out.append(c); i += 1
+t = ''.join(out)
+t = re.sub(r',(\s*[}\]])', r'\1', t)
+open(dst, 'w', encoding='utf-8').write(t)
+PYEOF
+}
+
+# 返回一个 jq 能读的等价文件：本身合法就用原文件，否则生成规范化副本
+readable_file() {
+  local f="$1" clean rc
+  if jq -e . "$f" >/dev/null 2>&1; then printf '%s\n' "$f"; return 0; fi
+  [ -n "${CLEAN[$f]:-}" ] && { printf '%s\n' "${CLEAN[$f]}"; return 0; }
+  mkdir -p "$BASE/clean"
+  clean="$BASE/clean/$(printf '%s' "$f" | md5sum | cut -c1-8)-$(basename "$f")"
+  if _sanitize_jsonc "$f" "$clean" && jq -e . "$clean" >/dev/null 2>&1; then
+    CLEAN[$f]="$clean"
+    printf '%s\n' "$clean"; return 0
+  fi
+  rm -f "$clean"
+  return 1
+}
+
 SKIPPED_FILES=()
 build_index() {
   IDX=(); SKIPPED_FILES=()
   jqok || return 1
   local f n i tag type port
+  local rf
   while IFS= read -r f; do
     [ -f "$f" ] || continue
-    if ! jq -e '.inbounds' "$f" >/dev/null 2>&1; then
+    if ! rf=$(readable_file "$f"); then
       case "$(basename "$f")" in
         *inbound*|*inb*) SKIPPED_FILES+=("$(basename "$f")") ;;
       esac
       continue
     fi
-    n=$(jq '.inbounds | length' "$f" 2>/dev/null) || continue
+    n=$(jq '.inbounds | length' "$rf" 2>/dev/null) || continue
     [ -n "$n" ] || continue
     if [ "$n" -eq 0 ]; then
       case "$(basename "$f")" in
@@ -369,9 +421,9 @@ build_index() {
       continue
     fi
     for ((i=0; i<n; i++)); do
-      tag=$(jq -r ".inbounds[$i].tag // \"-\"" "$f")
-      type=$(jq -r ".inbounds[$i].type // \"-\"" "$f")
-      port=$(jq -r ".inbounds[$i].listen_port // \"-\"" "$f")
+      tag=$(jq -r ".inbounds[$i].tag // \"-\"" "$rf")
+      type=$(jq -r ".inbounds[$i].type // \"-\"" "$rf")
+      port=$(jq -r ".inbounds[$i].listen_port // \"-\"" "$rf")
       IDX+=("$f|$i|$tag|$type|$port")
     done
   done < <(cfg_files)
@@ -1230,6 +1282,92 @@ cmd_update() {
   echo
 }
 
+# ------------------------------------------- 10.5 JSONC 规范化（修复 jq） ----
+cmd_fixjson() {
+  hr; say "JSONC 规范化"; hr
+  detect_cfg || { err "未找到配置，请先跑 sbopt doctor"; return 1; }
+  ensure_jq || return 1
+
+  local -a bad=()
+  local f
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    jq -e . "$f" >/dev/null 2>&1 || bad+=("$f")
+  done < <(cfg_files)
+
+  if [ ${#bad[@]} -eq 0 ]; then ok "所有文件都是严格 JSON，无需处理"; return 0; fi
+
+  warn "以下 ${#bad[@]} 个文件不是严格 JSON（含 // 注释 / 块注释 / 尾逗号）"
+  dim "sing-box 自己的解析器兼容它们，所以能正常加载；jq 严格，读不了"
+  for f in "${bad[@]}"; do dim "  $(basename "$f") ($(stat -c %s "$f" 2>/dev/null) B)"; done
+  echo
+  ask "原地规范化（去掉注释，原文件先备份）？" || return 0
+
+  local stage tmp out rc
+  local -a map=()
+  stage=$(mktemp -d)
+  cp -a "$CFG"/. "$stage"/ 2>/dev/null
+
+  for f in "${bad[@]}"; do
+    tmp=$(mktemp "/tmp/fixjson.XXXXXX")
+    if _sanitize_jsonc "$f" "$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
+      map+=("$f|$tmp")
+      cp "$tmp" "$stage/$(basename "$f")"
+    else
+      rm -f "$tmp"
+      err "$(basename "$f")：规范化失败，保持原样"
+    fi
+  done
+
+  if [ ${#map[@]} -eq 0 ]; then
+    err "没有可用的规范化结果"; rm -rf "$stage"; return 1
+  fi
+
+  if detect_bin; then
+    out=$("$SB_BIN" check -c "$stage" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+      err "规范化后的配置未通过 sing-box check，已放弃（原文件未改动）"
+      printf '%s\n' "$out" | head -8 | sed 's/^/       /'
+      rm -rf "$stage"
+      while IFS='|' read -r _ tmp; do rm -f "$tmp"; done < <(printf '%s\n' "${map[@]}")
+      return 1
+    fi
+    ok "规范化后的配置通过 sing-box check"
+  else
+    warn "未找到 sing-box 二进制，跳过检查（仍然先备份）"
+  fi
+
+  mkdir -p "$BK"
+  local -a pairs=()
+  local b
+  while IFS='|' read -r f tmp; do
+    b="$BK/$(date +%Y%m%d-%H%M%S)-$(basename "$f")"
+    cp -a "$f" "$b"
+    pairs+=("$f|$b|$tmp")
+  done < <(printf '%s\n' "${map[@]}")
+
+  local src bk new
+  while IFS='|' read -r src bk new; do
+    install -m 600 "$new" "$src"
+  done < <(printf '%s\n' "${pairs[@]}")
+
+  if restart_svc; then
+    ok "已规范化并重启服务：${#pairs[@]} 个文件"
+    while IFS='|' read -r _ _ new; do rm -f "$new"; done < <(printf '%s\n' "${pairs[@]}")
+    rm -rf "$stage"
+    dim "注释已被去掉；如需保留原样，备份在 $BK"
+    return 0
+  fi
+
+  err "重启失败，正在逐个恢复备份"
+  while IFS='|' read -r src bk _; do
+    cp -a "$bk" "$src"
+  done < <(printf '%s\n' "${pairs[@]}")
+  restart_svc && ok "已全部恢复并重启" || err "恢复后仍未启动，请手工检查"
+  rm -rf "$stage"
+  return 1
+}
+
 # --------------------------------------------------- 11. 配置文件逐个检查 ---
 cmd_files() {
   hr; say "配置文件逐个检查"; hr
@@ -1294,6 +1432,7 @@ ${c_b}
     8) 更新          从 GitHub 拉取最新版脚本
     9) 诊断          配置探测失败时用，输出各来源原始结果
    10) 文件检查      逐个校验配置 JSON 与入站端口，抓漏读
+   11) 规范化 JSONC  把带注释的配置文件转成严格 JSON（jq 可读）
     0) 退出
 ${c_d}
   提示：体检报「未找到配置」时，先跑 9
@@ -1312,6 +1451,7 @@ EOF
       8) cmd_update ;;
       9) cmd_doctor ;;
       10) cmd_files ;;
+      11) cmd_fixjson ;;
       0|q) exit 0 ;;
       *) ;;
     esac
@@ -1357,6 +1497,7 @@ case "${1:-}" in
   enable)   shift; cmd_enable "${1:-}" ;;
   rollback) cmd_rollback ;;
   files)    cmd_files ;;
+  fixjson)  cmd_fixjson ;;
   update)   cmd_update ;;
   version|-v) self_version "${BASH_SOURCE[0]}" ;;
   menu|"")  menu ;;
