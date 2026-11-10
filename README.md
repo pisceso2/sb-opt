@@ -28,7 +28,7 @@ sbopt
 | **系统优化** | BBR + fq + sysctl 调优 + 1G swap + 文件句柄 1048576（收益最大的一步） |
 | **配置调参** | REALITY 补 `utls: chrome`、Hysteria2 加 `obfs.salamander`、UDP/443 挪到 24443 |
 | **伪装站测速** | 实测 8 个候选站的 TCP/TLS 握手延迟，挑最快的填 `reality.handshake.server` |
-| **生成链接** | 输出 `vless://` 与 `hysteria2://`，直接粘贴进 v2rayN |
+| **生成链接** | 输出 `vless://`、`hysteria2://`、`trojan://`、`tuic://`、`anytls://`、`ss://`，直接粘贴进 v2rayN |
 | **启停入站** | `disable <tag>` 精简掉 TUIC / Argo，`enable <tag>` 随时恢复 |
 | **流量守护** | vnstat 统计 + 每日超 15GB 提醒（600GB 月配额） |
 | **回滚** | 一键恢复最近一次备份 |
@@ -64,7 +64,14 @@ sbopt disable <tag>    # 停用某入站，如：sbopt disable argo
 sbopt enable <tag>     # 恢复被停用的入站
 ```
 
-`<tag>` 是配置里 `inbounds[].tag` 的名字，`sbopt audit` 会列出来；记不住也**可以直接写协议名**，如 `sbopt disable tuic`、`sbopt port hysteria2 24443`。
+`<tag|type>` 支持四种写法，`sbopt audit` 会列出序号和 tag：
+
+| 写法 | 例子 | 说明 |
+|---|---|---|
+| 序号 | `sbopt disable 2` | 对应 audit 输出的 `#` 列，**tag 带 emoji/空格时最省事** |
+| tag 精确 | `sbopt disable "my-node"` | 需完整匹配 |
+| tag 包含 | `sbopt disable tuic` | 忽略大小写，匹配 `🇭🇰 xxx tuic` 这类长 tag |
+| 协议名 | `sbopt port hy2 24443` | 支持 `hy2`/`ss`/`stls` 等别名 |
 
 ## 配置探测
 
@@ -92,7 +99,7 @@ sbopt enable <tag>     # 恢复被停用的入站
 手动自查：
 
 ```bash
-wc -l /root/sb-opt/sb-opt.sh              # 应 >= 500，1.1.1 约 1098
+wc -l /root/sb-opt/sb-opt.sh              # 应 >= 500，1.2.0 约 1150
 grep -m1 '^# VERSION' /root/sb-opt/sb-opt.sh
 tail -1 /root/sb-opt/sb-opt.sh            # 应看到 __END_SBOPT__
 ```
