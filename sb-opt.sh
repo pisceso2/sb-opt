@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.3.0
+# VERSION 1.3.1
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -361,6 +361,7 @@ build_index() {
       continue
     fi
     n=$(jq '.inbounds | length' "$f" 2>/dev/null) || continue
+    [ -n "$n" ] || continue
     if [ "$n" -eq 0 ]; then
       case "$(basename "$f")" in
         *inbound*|*inb*) SKIPPED_FILES+=("$(basename "$f")（inbounds 为空）") ;;
@@ -639,8 +640,13 @@ cmd_audit() {
   ok "配置：$CFG"
   dim "模式：$([ "$CFG_MULTI" = 1 ] && echo '多文件目录' || echo '单文件')    来源：$CFG_SRC"
   printf '  服务    : %s  %s\n' "${SVC:-未找到}" "$(systemctl is-active "${SVC:-none}" 2>/dev/null)"
-  printf '  版本    : %s\n' "$(detect_bin && "$SB_BIN" version 2>/dev/null | head -1 || echo '未找到 sing-box/xray 二进制')"
-  printf '  二进制  : %s\n' "${SB_BIN:-未找到}"
+  if detect_bin; then
+    printf '  二进制  : %s\n' "$SB_BIN"
+    printf '  版本    : %s\n' "$("$SB_BIN" version 2>/dev/null | head -1)"
+  else
+    printf '  二进制  : %s未找到%s（改配置时将跳过 sing-box check）\n' "$c_y" "$c_0"
+    printf '  版本    : %s\n' "未知"
+  fi
 
   if ! jqok; then warn "缺少 jq，无法解析配置（跑 sys 会自动安装）"; return 0; fi
 
@@ -709,7 +715,7 @@ cmd_audit() {
     [ -n "$pp" ] || continue
     case " ${declared[*]} " in *" $pp "*) ;; *) unknown+=("$pp") ;; esac
   done < <(ss -lntup 2>/dev/null | grep -E 'sing-box|xray' \
-             | awk '$5 !~ /^127\.0\.0\.1:/ && $5 !~ /^\[::1\]:/ {n=split($5,a,":"); print a[n]}' \
+             | awk '$5 !~ /^127\.0\.0\.1:/ && $5 !~ /^\[::1\]:/ {n=split($5,a,":"); p=a[n]; if (p >= 30000) next; print p}' \
              | sort -un)
 
   if [ ${#unknown[@]} -gt 0 ]; then
@@ -1224,6 +1230,51 @@ cmd_update() {
   echo
 }
 
+# --------------------------------------------------- 11. 配置文件逐个检查 ---
+cmd_files() {
+  hr; say "配置文件逐个检查"; hr
+  detect_cfg || { err "未找到配置目录，请先跑 sbopt doctor"; return 1; }
+  ensure_jq || return 1
+  dim "配置：$CFG（$([ "$CFG_MULTI" = 1 ] && echo 多文件目录 || echo 单文件)）"
+  echo
+  printf '  %-40s %8s  %-9s %s\n' "文件" "大小" "JSON" "入站（type:port）"
+  printf '  %s\n' "$(printf '%.0s-' {1..78})"
+
+  local f size st types err1 bad=0
+  while IFS= read -r f; do
+    size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    err1=$(jq -e . "$f" 2>&1 >/dev/null | head -1)
+    if [ -z "$err1" ]; then
+      st="OK"
+      types=$(jq -r '[.inbounds[]? | "\(.type):\(.listen_port // "-")"] | join(", ")' "$f" 2>/dev/null)
+      [ -z "$types" ] && types="（无 inbounds）"
+      printf '  %-40s %8s  %-9s %s\n' "$(basename "$f")" "$size" "$st" "$types"
+    else
+      bad=$((bad+1))
+      printf '  %-40s %8s  %s%s%s %s\n' "$(basename "$f")" "$size" "$c_r" "FAIL" "$c_0" "${err1:0:40}"
+    fi
+  done < <(cfg_files)
+
+  echo
+  if [ "$bad" -gt 0 ]; then
+    warn "$bad 个文件不是合法的 JSON，sing-box 能跑但不代表它们被加载了"
+    dim "常见原因：文件里混入了注释 // 或 /* */、结尾多了逗号、被编辑器插入 BOM"
+    dim "修法：把该文件贴给脚本作者，或手工删掉注释与尾逗号后 systemctl restart sing-box"
+  else
+    ok "所有文件 JSON 合法"
+  fi
+
+  # 重复端口 / 重复 tag 检查
+  local dup_port dup_tag
+  dup_port=$(build_index >/dev/null 2>&1; for e in "${IDX[@]}"; do printf '%s\n' "$(printf '%s' "$e" | cut -d'|' -f5)"; done \
+             | grep -v '^-$' | sort | uniq -d | tr '\n' ' ')
+  dup_tag=$(build_index >/dev/null 2>&1; for e in "${IDX[@]}"; do printf '%s\n' "$(printf '%s' "$e" | cut -d'|' -f3)"; done \
+            | sort | uniq -d | tr '\n' ' ')
+  [ -n "${dup_port// /}" ] && warn "端口重复：$dup_port"
+  [ -n "${dup_tag// /}" ] && warn "tag 重复：$dup_tag（disable 时只能命中第一个）"
+  echo
+}
+
 # ------------------------------------------------------------ 菜单 --------
 menu() {
   while :; do
@@ -1242,6 +1293,7 @@ ${c_b}
     7) 回滚          恢复最近一次备份
     8) 更新          从 GitHub 拉取最新版脚本
     9) 诊断          配置探测失败时用，输出各来源原始结果
+   10) 文件检查      逐个校验配置 JSON 与入站端口，抓漏读
     0) 退出
 ${c_d}
   提示：体检报「未找到配置」时，先跑 9
@@ -1259,6 +1311,7 @@ EOF
       7) cmd_rollback ;;
       8) cmd_update ;;
       9) cmd_doctor ;;
+      10) cmd_files ;;
       0|q) exit 0 ;;
       *) ;;
     esac
@@ -1303,6 +1356,7 @@ case "${1:-}" in
   disable)  shift; cmd_disable "${1:-}" ;;
   enable)   shift; cmd_enable "${1:-}" ;;
   rollback) cmd_rollback ;;
+  files)    cmd_files ;;
   update)   cmd_update ;;
   version|-v) self_version "${BASH_SOURCE[0]}" ;;
   menu|"")  menu ;;
