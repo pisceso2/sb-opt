@@ -15,6 +15,13 @@ set -euo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/pisceso2/sb-opt/main"
 SELF_URL="$REPO_RAW/sb-opt.sh"
+# 多源下载：raw.githubusercontent 在国内常不可达
+MIRRORS=(
+  "$REPO_RAW"
+  "https://cdn.jsdelivr.net/gh/pisceso2/sb-opt@main"
+  "https://raw.gitmirror.com/pisceso2/sb-opt/main"
+  "https://ghfast.top/https://raw.githubusercontent.com/pisceso2/sb-opt/main"
+)
 DEST="/root/sb-opt/sb-opt.sh"
 BIN="/usr/local/bin/sbopt"
 
@@ -34,7 +41,14 @@ command -v curl >/dev/null 2>&1 || {
 echo ">>> 下载 sb-opt.sh"
 mkdir -p /root/sb-opt
 TMP=$(mktemp /tmp/sbopt.XXXXXX)
-curl -fsSL --max-time 60 "$SELF_URL" -o "$TMP" || { err "下载失败"; rm -f "$TMP"; exit 1; }
+GOT=0
+for M in "${MIRRORS[@]}"; do
+  echo "    尝试 $M"
+  if curl -fsSL --max-time 40 "$M/sb-opt.sh" -o "$TMP" 2>/dev/null && [ -s "$TMP" ]; then
+    GOT=1; ok "下载成功：$M"; break
+  fi
+done
+[ "$GOT" = 1 ] || { err "所有下载源都失败，请检查网络后重试"; rm -f "$TMP"; exit 1; }
 
 echo ">>> 语法校验"
 bash -n "$TMP" || { err "下载的文件语法有误，未安装"; rm -f "$TMP"; exit 1; }
