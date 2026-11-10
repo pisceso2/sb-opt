@@ -1,28 +1,36 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.0.0
+# VERSION 1.1.0
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
 #  场景：香港 2C2G 小机 + sing-box 四合一（Reality / Hysteria2 / TUIC / Argo）
 #
+#  v1.1.0 变更：
+#    · 配置探测重写：运行进程参数 / systemd ExecStart / docker / 已知路径 /
+#      受限 find 五路探测，兼容 mack-a 等多文件目录布局
+#    · 新增 doctor 子命令，探测失败时可单独出诊断报告
+#    · 多文件目录模式下按「文件+索引」精确定位入站再修改
+#
 #  安全原则：
 #    1) 改动配置前自动备份到 /root/sb-opt/backups/
-#    2) 改动后执行 sing-box check 校验
+#    2) 改动后执行 sing-box check 校验（目录模式在临时副本上校验）
 #    3) 校验或重启失败 -> 自动回滚到上一份可用配置
 #    4) 幂等：反复执行不会重复叠加
 #
 #  用法：bash sb-opt.sh                 交互菜单
+#        bash sb-opt.sh doctor          只做配置探测诊断（只读）
 #        bash sb-opt.sh audit           只体检（只读，不改任何东西）
 #        bash sb-opt.sh sys             系统层优化（BBR/sysctl/swap/句柄）
 #        bash sb-opt.sh tune            配置层调参（逐项确认）
 #        bash sb-opt.sh dest            REALITY 伪装站选优
 #        bash sb-opt.sh links           生成客户端链接
-#        bash sb-opt.sh port <tag> <n>  改某个入站端口
-#        bash sb-opt.sh disable <tag>   停用某个入站
-#        bash sb-opt.sh enable <tag>    恢复某个入站
+#        bash sb-opt.sh port <tag|type> <n>  改某个入站端口
+#        bash sb-opt.sh disable <tag|type>  停用某个入站
+#        bash sb-opt.sh enable <tag|type>   恢复某个入站
 #        bash sb-opt.sh traffic         流量统计 + 每日配额提醒
 #        bash sb-opt.sh rollback        回滚到最近一次备份
+#        bash sb-opt.sh update          从 GitHub 拉取最新版
 # ============================================================================
 
 set -uo pipefail
@@ -33,8 +41,13 @@ DIS="$BASE/disabled"
 LOGF="$BASE/sb-opt.log"
 SYSCTL_FILE="/etc/sysctl.d/99-sb-opt.conf"
 REPO_RAW="https://raw.githubusercontent.com/pisceso2/sb-opt/main"
-CFG=""
-SVC=""
+
+CFG=""          # 配置文件，或（多文件模式）配置目录
+CFG_MULTI=0     # 1 = 目录多文件
+CFG_SRC=""      # 探测来源说明
+CONTAINER=""    # docker 容器名（若适用）
+SVC=""          # systemd 服务名
+SB_BIN=""       # sing-box / xray 可执行文件路径
 
 c_0=$'\e[0m'; c_r=$'\e[31m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_b=$'\e[36m'; c_d=$'\e[90m'
 
@@ -56,30 +69,6 @@ ask() {
   [[ $a =~ ^[Yy]$ ]]
 }
 
-# ---------------------------------------------------------------- 环境探测 --
-detect_cfg() {
-  local p
-  for p in /etc/sing-box/config.json /usr/local/etc/sing-box/config.json \
-           /opt/sing-box/config.json /root/sing-box/config.json \
-           /etc/xray/config.json /usr/local/etc/xray/config.json; do
-    [ -f "$p" ] && { CFG="$p"; return 0; }
-  done
-  if command -v systemctl >/dev/null 2>&1; then
-    p=$(systemctl cat sing-box 2>/dev/null | grep -oE '/[^ "]+config\.json' | head -1)
-    [ -n "${p:-}" ] && [ -f "$p" ] && { CFG="$p"; return 0; }
-  fi
-  return 1
-}
-
-detect_svc() {
-  local s
-  for s in sing-box singbox sing-box-server xray; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service"; then
-      SVC="$s"; return 0
-    fi
-  done
-  return 1
-}
 
 req_pkg() {
   local miss=()
@@ -100,72 +89,396 @@ kernel_ok() {
   [ "$(printf '%s\n4.9\n' "$cur" | sort -V | head -1)" = "4.9" ]
 }
 
-# ------------------------------------------------------- 备份 / 校验 / 回滚 --
-backup_cfg() {
-  [ -f "$CFG" ] || return 0
-  mkdir -p "$BK"
-  local f="$BK/$(date +%Y%m%d-%H%M%S)-${1// /_}.json"
-  cp -a "$CFG" "$f"
-  dim "已备份 -> $f"
-  # 只保留最近 15 份
-  ls -1t "$BK"/*.json 2>/dev/null | tail -n +16 | xargs -r rm -f
+_JQSTATE=""
+jqok() {
+  if [ -z "$_JQSTATE" ]; then
+    if command -v jq >/dev/null 2>&1 \
+       && printf '{"a":1}' | jq -e '.a==1' >/dev/null 2>&1; then _JQSTATE=1; else _JQSTATE=0; fi
+  fi
+  [ "$_JQSTATE" = 1 ]
 }
 
-check_cfg_file() {   # $1=配置文件路径；返回 0=通过
-  local f="$1" out
-  command -v sing-box >/dev/null 2>&1 || return 0     # 没装 sing-box 就跳过
-  out=$(sing-box check -c "$f" 2>&1) && return 0
-  grep -qi 'unknown command\|unknown flag' <<<"$out" && return 0   # 老版本无 check
+# 确保 jq 可用（不可用则自动安装），v1.1 起所有解析都依赖它
+ensure_jq() {
+  jqok && return 0
+  req_pkg jq
+  _JQSTATE=""
+  jqok && return 0
+  err "jq 不可用，请手动安装：apt install -y jq"
+  return 1
+}
+
+# ============================================================ 配置探测 ======
+# 探测来源（按可信度）：
+#   1) 正在运行的 sing-box/xray 进程命令行里的 -c / --config
+#   2) systemd 单元 ExecStart 里的 -c / --config
+#   3) docker 容器（映射到宿主机的路径）
+#   4) 已知安装路径
+#   5) 受限 find（/etc /opt /root /usr/local 下 5 层内）
+
+_p_pid() {
+  local pid cmd path
+  for pid in $(pgrep -f '[s]ing-box|[x]ray|[v]2ray' 2>/dev/null); do
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    path=$(printf '%s\n' "$cmd" | tr ' ' '\n' \
+           | awk 'p{print;exit} /^-c$|^--config$|^-config$/{p=1}' )
+    [ -n "${path:-}" ] && printf '%s|进程 %s\n' "$path" "$pid"
+    # 也支持 -c/path 粘连写法
+    printf '%s\n' "$cmd" | grep -oE '\-c/?[^ ]+\.(json|yaml)' 2>/dev/null \
+      | sed -E 's/^-c//' | while read -r q; do [ -n "$q" ] && printf '%s|进程参数\n' "$q"; done
+  done
+}
+
+_p_unit() {
+  local u a path
+  for u in $(systemctl list-unit-files --no-legend --no-pager 2>/dev/null \
+             | awk '{print $1}' | grep -Ei 'sing|xray|v2ray|hysteria|hy2|tuic|mihomo'); do
+    a=$(systemctl show -p ExecStart --value "$u" 2>/dev/null) || continue
+    path=$(printf '%s\n' "${a//;/ }" | tr ' ' '\n' \
+           | awk 'p{print;exit} /^-c$|^--config$|^-config$/{p=1}')
+    [ -n "${path:-}" ] && printf '%s|单元 %s\n' "$path" "$u"
+  done
+}
+
+_p_docker() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local line name img cpath hostpath mnts
+  docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null | while IFS='|' read -r name img; do
+    printf '%s' "$img" | grep -qiE 'sing-box|xray|v2ray|hysteria|mihomo' || continue
+    cpath=$(docker inspect "$name" --format '{{range .Config.Cmd}}{{.}} {{end}}' 2>/dev/null \
+            | tr ' ' '\n' | awk 'p{print;exit} /^-c$|^--config$/{p=1}')
+    mnts=$(docker inspect "$name" --format '{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' 2>/dev/null)
+    hostpath=""
+    if [ -n "${cpath:-}" ]; then
+      for pair in $mnts; do
+        src="${pair%%:*}"; dst="${pair#*:}"
+        case "$cpath" in
+          "$dst"/*) hostpath="$src/${cpath#"$dst"/}" ;;
+          "$dst")   hostpath="$src" ;;
+        esac
+        [ -n "$hostpath" ] && break
+      done
+      [ -z "$hostpath" ] && hostpath="$cpath"
+    fi
+    [ -n "${hostpath:-}" ] && printf '%s|docker %s（容器内 %s）\n' "$hostpath" "$name" "${cpath:-未知}"
+  done
+}
+
+_p_known() {
+  local p
+  for p in \
+    /etc/sing-box/config.json \
+    /usr/local/etc/sing-box/config.json \
+    /opt/sing-box/config.json \
+    /root/sing-box/config.json \
+    /etc/sing-box/conf/config.json \
+    /etc/v2ray-agent/sing-box/conf/config \
+    /etc/v2ray-agent/sing-box/conf \
+    /usr/local/etc/v2ray-agent/sing-box/conf/config \
+    /etc/xray/config.json \
+    /usr/local/etc/xray/config.json \
+    /etc/v2ray-agent/xray/conf \
+    /usr/local/etc/xray/conf
+  do
+    [ -e "$p" ] && printf '%s|已知路径\n' "$p"
+  done
+}
+
+_p_find() {
+  find /etc /opt /root /usr/local/etc -maxdepth 5 \
+       \( -name 'config.json' -o -name '*sing*.json' -o -name 'config-*.json' \) \
+       -path '*sing*' 2>/dev/null | head -20 | while read -r p; do
+    printf '%s|find\n' "$p"
+  done
+}
+
+# 目录是否像 sing-box 多文件配置目录
+dir_looks_like_cfg() {
+  local d="$1" f n=0 hit=0
+  [ -d "$d" ] || return 1
+  for f in "$d"/*.json; do
+    [ -f "$f" ] || continue
+    n=$((n+1))
+    if jqok; then
+      jq -e '.inbounds // .outbounds' "$f" >/dev/null 2>&1 && hit=$((hit+1))
+    else
+      grep -qE '"(inbounds|outbounds)"' "$f" 2>/dev/null && hit=$((hit+1))
+    fi
+    [ "$n" -ge 20 ] && break
+  done
+  [ "$n" -gt 0 ] && [ "$hit" -gt 0 ]
+}
+
+# 单文件是否像 sing-box/xray 配置
+file_looks_like_cfg() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  case "$f" in *.yaml|*.yml) return 1 ;; esac
+  [ "$f" = "/etc/sing-box/config.json" ] && return 0
+  grep -q '"inbounds"' "$f" 2>/dev/null
+}
+
+# 接受候选路径，判定并设置 CFG / CFG_MULTI
+_accept_cfg() {
+  local path="${1%%|*}" src="${1#*|}"
+  [ -n "$path" ] || return 1
+
+  # docker 场景：记下容器名，后续重启走 docker restart
+  case "$src" in
+    docker\ *) CONTAINER=$(printf '%s' "$src" | sed -E 's/^docker +//; s/[（(].*$//' | tr -d ' ') ;;
+  esac
+
+  if [ -d "$path" ]; then
+    dir_looks_like_cfg "$path" || return 1
+    CFG="$path"; CFG_MULTI=1; CFG_SRC="$src"
+    return 0
+  fi
+  if [ -f "$path" ]; then
+    file_looks_like_cfg "$path" || return 1
+    CFG="$path"; CFG_MULTI=0; CFG_SRC="$src"
+    return 0
+  fi
+  return 1
+}
+
+# 探测失败时，把带 inbounds 的 json 找出来做兜底
+_fallback_scan() {
+  local f
+  while read -r f; do
+    [ -f "$f" ] || continue
+    grep -q '"inbounds"' "$f" 2>/dev/null || continue
+    # 判断是否属于某个多文件目录
+    local d; d=$(dirname "$f")
+    if dir_looks_like_cfg "$d"; then
+      CFG="$d"; CFG_MULTI=1; CFG_SRC="兜底扫描"
+      return 0
+    fi
+    CFG="$f"; CFG_MULTI=0; CFG_SRC="兜底扫描"
+    return 0
+  done < <(find /etc /opt /root /usr/local /srv -maxdepth 6 -name '*.json' -size -2M 2>/dev/null | head -200)
+  return 1
+}
+
+detect_cfg() {
+  [ -n "$CFG" ] && return 0
+  local c
+
+  # 探测依赖 jq（判断目录/文件是否为配置），缺失时静默装一次
+  if ! jqok; then
+    req_pkg jq >/dev/null 2>&1 || true
+    _JQSTATE=""; jqok || true
+  fi
+
+  # 1) 进程
+  while IFS= read -r c; do _accept_cfg "$c" && return 0; done < <(_p_pid)
+  # 2) systemd
+  while IFS= read -r c; do _accept_cfg "$c" && return 0; done < <(_p_unit)
+  # 3) docker
+  while IFS= read -r c; do _accept_cfg "$c" && return 0; done < <(_p_docker)
+  # 4) 已知路径
+  while IFS= read -r c; do _accept_cfg "$c" && return 0; done < <(_p_known)
+  # 5) find
+  while IFS= read -r c; do _accept_cfg "$c" && return 0; done < <(_p_find)
+  # 6) 兜底
+  _fallback_scan && return 0
+  return 1
+}
+
+detect_svc() {
+  [ -n "$SVC" ] && return 0
+  local u
+  for u in sing-box singbox sing-box-server xray v2ray mihomo hysteria-server hysteria; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${u}\.service"; then
+      SVC="$u"; return 0
+    fi
+  done
+  # 退一步：从进程反推服务名
+  local pid
+  for pid in $(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null | head -1); do
+    systemctl status "$pid" 2>/dev/null | head -1 | grep -oE '[a-zA-Z0-9_.-]+\.service' \
+      && { SVC=$(systemctl status "$pid" 2>/dev/null | head -1 | grep -oE '[a-zA-Z0-9_.-]+\.service' | sed 's/\.service$//'); return 0; }
+  done
+  return 1
+}
+
+# 配置里的所有 json 文件（多文件目录 -> 多个）
+cfg_files() {
+  if [ "$CFG_MULTI" = 1 ]; then
+    find "$CFG" -maxdepth 1 -name '*.json' -type f | sort
+  else
+    echo "$CFG"
+  fi
+}
+
+# ==================================================== 入站索引（文件+下标） ==
+declare -a IDX=()   # 每项 "文件|下标|tag|type|端口"
+build_index() {
+  IDX=()
+  jqok || return 1
+  local f n i tag type port
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    jq -e '.inbounds' "$f" >/dev/null 2>&1 || continue
+    n=$(jq '.inbounds | length' "$f" 2>/dev/null) || continue
+    for ((i=0; i<n; i++)); do
+      tag=$(jq -r ".inbounds[$i].tag // \"-\"" "$f")
+      type=$(jq -r ".inbounds[$i].type // \"-\"" "$f")
+      port=$(jq -r ".inbounds[$i].listen_port // \"-\"" "$f")
+      IDX+=("$f|$i|$tag|$type|$port")
+    done
+  done < <(cfg_files)
+  [ ${#IDX[@]} -gt 0 ]
+}
+
+# 按 tag 或 type 查找索引项，输出 "文件|下标"
+locate_inbound() {
+  local key="$1" e tag type
+  for e in "${IDX[@]}"; do
+    tag=$(printf '%s' "$e" | cut -d'|' -f3)
+    type=$(printf '%s' "$e" | cut -d'|' -f4)
+    [ "$tag" = "$key" ] && { printf '%s|%s\n' "$(printf '%s' "$e" | cut -d'|' -f1)" \
+                                                   "$(printf '%s' "$e" | cut -d'|' -f2)"; return 0; }
+  done
+  for e in "${IDX[@]}"; do
+    type=$(printf '%s' "$e" | cut -d'|' -f4)
+    [ "$type" = "$key" ] && { printf '%s|%s\n' "$(printf '%s' "$e" | cut -d'|' -f1)" \
+                                                   "$(printf '%s' "$e" | cut -d'|' -f2)"; return 0; }
+  done
+  return 1
+}
+
+# =================================================== 备份 / 校验 / 回滚 ====
+backup_file() {
+  local f="$1" desc="$2"
+  [ -f "$f" ] || return 0
+  mkdir -p "$BK"
+  local b="$BK/$(date +%Y%m%d-%H%M%S)-$(basename "$f")"
+  cp -a "$f" "$b"
+  printf '%s\n' "$f" >"$BASE/last_target"
+  printf '%s\n' "$b" >"$BASE/last_backup"
+  dim "已备份 -> $b"
+  ls -1t "$BK"/* 2>/dev/null | tail -n +16 | xargs -r rm -f
+  log "backup $f -> $b ($desc)"
+}
+
+detect_bin() {
+  [ -n "$SB_BIN" ] && return 0
+  local p
+  for p in sing-box xray /usr/local/bin/sing-box /usr/bin/sing-box \
+           /etc/v2ray-agent/sing-box/sing-box /etc/v2ray-agent/xray/xray \
+           /opt/sing-box/sing-box /usr/local/bin/xray /usr/bin/xray; do
+    case "$p" in
+      /*) [ -x "$p" ] && { SB_BIN="$p"; return 0; } ;;
+      *)  command -v "$p" >/dev/null 2>&1 && { SB_BIN=$(command -v "$p"); return 0; } ;;
+    esac
+  done
+  return 1
+}
+
+check_cfg() {   # 校验 CFG（单文件或目录）；$1 可选=替换后的临时文件
+  detect_bin || return 0
+  local out rc stage
+  if [ "$CFG_MULTI" = 1 ]; then
+    stage=$(mktemp -d)
+    cp -a "$CFG"/. "$stage"/ 2>/dev/null
+    [ -n "${1:-}" ] && cp "$1" "$stage/$(basename "$TARGET_FILE")"
+    out=$("$SB_BIN" check -c "$stage" 2>&1); rc=$?
+    rm -rf "$stage"
+  else
+    out=$("$SB_BIN" check -c "${1:-$CFG}" 2>&1); rc=$?
+  fi
+  [ $rc -eq 0 ] && return 0
+  grep -qi 'unknown command\|unknown flag\|flag provided but not defined' <<<"$out" && return 0
   printf '%s\n' "$out" | sed 's/^/       /' >&2
   return 1
 }
 
 restart_svc() {
+  if [ -n "$CONTAINER" ]; then
+    docker restart "$CONTAINER" >/dev/null 2>&1 && return 0
+    return 1
+  fi
   [ -n "$SVC" ] || return 1
   systemctl restart "$SVC" >/dev/null 2>&1
   sleep 2
   systemctl is-active --quiet "$SVC"
 }
 
-rollback_latest() {
-  local f
-  f=$(ls -1t "$BK"/*.json 2>/dev/null | head -1)
-  [ -n "${f:-}" ] || { err "没有可用备份"; return 1; }
-  cp -a "$f" "$CFG"
-  restart_svc && ok "已回滚到 $(basename "$f")" || err "回滚后服务仍无法启动，请手工检查"
-  log "rollback to $f"
-}
-
-# 用法：apply_cfg "说明" [jq选项 ...] "jq表达式"
-#   注意：jq 要求选项写在表达式之前，否则会被当成文件名
-apply_cfg() {
-  local desc="$1"; shift
-  local tmp rc
+# apply_file <文件> <说明> [jq选项...] <jq表达式>
+apply_file() {
+  local f="$1" desc="$2"; shift 2
+  local tmp
+  TARGET_FILE="$f"
   tmp=$(mktemp "/tmp/sbcfg.XXXXXX.json")
-  if ! jq "$@" "$CFG" >"$tmp" 2>"$BASE/jq.err"; then
+  if ! jq "$@" "$f" >"$tmp" 2>"$BASE/jq.err"; then
     err "$desc：jq 处理失败"; sed 's/^/       /' "$BASE/jq.err" >&2; rm -f "$tmp"; return 1
   fi
-  if ! check_cfg_file "$tmp"; then
+  if ! check_cfg "$tmp"; then
     err "$desc：新配置未通过校验，已放弃本次修改"
     cp "$tmp" "$BASE/last-failed.json" 2>/dev/null
     rm -f "$tmp"; return 1
   fi
-  backup_cfg "$desc"
-  install -m 600 "$tmp" "$CFG"
+  backup_file "$f" "$desc"
+  install -m 600 "$tmp" "$f"
   rm -f "$tmp"
   if restart_svc; then
-    ok "$desc —— 已生效"
-    log "applied: $desc"
+    ok "$desc —— 已生效"; log "applied: $desc ($f)"
     return 0
   fi
   err "$desc：重启失败，正在回滚"
-  rollback_latest
+  rollback_last
   return 1
 }
 
-inbound_count() { jq '.inbounds | length' "$CFG" 2>/dev/null || echo 0; }
+rollback_last() {
+  local t b
+  t=$(cat "$BASE/last_target" 2>/dev/null)
+  b=$(cat "$BASE/last_backup" 2>/dev/null)
+  if [ -n "${t:-}" ] && [ -n "${b:-}" ] && [ -f "$b" ]; then
+    cp -a "$b" "$t"
+    restart_svc && ok "已回滚 $(basename "$b") -> $t" || err "回滚后服务仍无法启动，请手工检查"
+    log "rollback $b -> $t"
+    return 0
+  fi
+  err "没有可用的最近备份"
+  return 1
+}
 
-# ------------------------------------------------------------ 1. 体检 ------
+# ==================================================== 1. 配置探测诊断 ======
+cmd_doctor() {
+  hr; say "配置探测诊断"; hr
+  ensure_jq
+
+  printf '  探测进程 : %s\n' "$(pgrep -f '[s]ing-box|[x]ray' 2>/dev/null | tr '\n' ' ')"
+  local u
+  printf '  候选单元 : %s\n' \
+    "$(systemctl list-unit-files --no-legend --no-pager 2>/dev/null | awk '{print $1}' \
+       | grep -Ei 'sing|xray|v2ray|hysteria|hy2|tuic' | tr '\n' ' ')"
+
+  hr; say "各来源原始输出"; hr
+  echo "  [进程参数]"; _p_pid    | sed 's/^/    /' || echo "    （无）"
+  echo "  [systemd]";   _p_unit   | sed 's/^/    /' || echo "    （无）"
+  echo "  [docker]";    _p_docker | sed 's/^/    /' || echo "    （无）"
+  echo "  [已知路径]";  _p_known  | sed 's/^/    /' || echo "    （无）"
+  echo "  [find]";      _p_find   | sed 's/^/    /' || echo "    （无）"
+
+  hr; say "判定结果"; hr
+  detect_svc && ok "systemd 服务：$SVC" || warn "未找到 systemd 服务（可能是 docker 或前台进程）"
+  detect_bin && ok "二进制：$SB_BIN" || warn "未找到 sing-box/xray 二进制，跳过配置校验"
+  [ -n "$CONTAINER" ] && ok "docker 容器：$CONTAINER（改动后走 docker restart）"
+  if detect_cfg; then
+    ok "配置：$CFG"
+    ok "模式：$([ "$CFG_MULTI" = 1 ] && echo '多文件目录' || echo '单文件')"
+    ok "来源：$CFG_SRC"
+    echo "  文件清单："
+    cfg_files | sed 's/^/    /'
+  else
+    err "仍未定位到配置，请把上面全部输出贴回来"
+  fi
+  echo
+}
+
+# ------------------------------------------------------------ 2. 体检 ------
 cmd_audit() {
   hr; say "环境体检"; hr
 
@@ -175,10 +488,9 @@ cmd_audit() {
   else printf '  %s(<4.9，BBR 不可用，建议重装 Debian 12)%s\n' "$c_r" "$c_0"; fi
   printf '  架构    : %s\n' "$(uname -m)"
 
-  local mem_total mem_used
+  local mem_total
   mem_total=$(awk '/MemTotal/{printf "%.0f", $2/1024}' /proc/meminfo)
-  mem_used=$(awk '/MemAvailable/{printf "%.0f", ('"$mem_total"'*1024-$2)/1024}' /proc/meminfo)
-  printf '  内存    : %sMB 总 / 约 %sMB 已用\n' "$mem_total" "$mem_used"
+  printf '  内存    : %sMB\n' "$mem_total"
   printf '  Swap    : %s\n' "$(swapon --show --noheadings 2>/dev/null | awk '{print $3}' | head -1)"
 
   printf '  拥塞控制: %s' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
@@ -190,31 +502,33 @@ cmd_audit() {
   hr
   if ! detect_cfg; then
     err "未找到 sing-box / xray 配置文件"
-    dim "常见路径：/etc/sing-box/config.json  /usr/local/etc/sing-box/config.json"
+    dim "请先执行：sbopt doctor   然后把输出发出来"
     return 0
   fi
   detect_svc
-  ok "配置文件: $CFG"
-  printf '  服务    : %s  %s\n' "${SVC:-未找到}" "$(systemctl is-active "$SVC" 2>/dev/null)"
-  printf '  版本    : %s\n' "$(sing-box version 2>/dev/null | head -1)"
+  [ -f "$BASE/last_target" ] || true
+  ok "配置：$CFG"
+  dim "模式：$([ "$CFG_MULTI" = 1 ] && echo '多文件目录' || echo '单文件')    来源：$CFG_SRC"
+  printf '  服务    : %s  %s\n' "${SVC:-未找到}" "$(systemctl is-active "${SVC:-none}" 2>/dev/null)"
+  printf '  版本    : %s\n' "$(detect_bin && "$SB_BIN" version 2>/dev/null | head -1 || echo '未找到 sing-box/xray 二进制')"
+  printf '  二进制  : %s\n' "${SB_BIN:-未找到}"
 
-  command -v jq >/dev/null 2>&1 || { warn "缺少 jq，无法解析配置（跑 sys 会自动安装）"; return 0; }
-
-  if ! jq -e '.inbounds' "$CFG" >/dev/null 2>&1; then
-    warn "配置结构不是标准 .inbounds 数组，跳过深层分析"
-    return 0
-  fi
+  if ! jqok; then warn "缺少 jq，无法解析配置（跑 sys 会自动安装）"; return 0; fi
 
   hr; say "入站清单"; hr
-  printf '  %-14s %-12s %-7s %-6s %s\n' "TAG" "类型" "端口" "监听" "备注"
+  if ! build_index; then
+    warn "配置里没有可解析的 .inbounds 数组"
+    dim "可能是 hysteria 的 yaml 配置，或 sing-box 只用 .outbounds 做客户端"
+    return 0
+  fi
+  printf '  %-3s %-16s %-12s %-7s %s\n' "#" "TAG" "类型" "端口" "备注"
   printf '  %s\n' "$(printf '%.0s-' {1..62})"
-  local n i type tag port listen note
-  n=$(inbound_count)
-  for ((i=0; i<n; i++)); do
-    tag=$(jq -r ".inbounds[$i].tag // \"-\"" "$CFG")
-    type=$(jq -r ".inbounds[$i].type // \"-\"" "$CFG")
-    port=$(jq -r ".inbounds[$i].listen_port // \"-\"" "$CFG")
-    listen=$(jq -r ".inbounds[$i].listen // \"-\"" "$CFG")
+  local k=0 e tag type port note
+  for e in "${IDX[@]}"; do
+    k=$((k+1))
+    tag=$(printf '%s' "$e" | cut -d'|' -f3)
+    type=$(printf '%s' "$e" | cut -d'|' -f4)
+    port=$(printf '%s' "$e" | cut -d'|' -f5)
     case "$type" in
       vless)     note="REALITY/Vision，TCP 主力" ;;
       hysteria2) note="QUIC 抗丢包，最费流量" ;;
@@ -222,9 +536,10 @@ cmd_audit() {
       vmess|trojan) note="常规代理" ;;
       *)         note="" ;;
     esac
-    printf '  %-14s %-12s %-7s %-6s %s\n' "$tag" "$type" "$port" "$listen" "$note"
+    printf '  %-3s %-16s %-12s %-7s %s\n' "$k" "$tag" "$type" "$port" "$note"
   done
 
+  local n=${#IDX[@]}
   [ "$n" -gt 2 ] && { hr; warn "当前有 $n 个入站，建议只保留 2 个（REALITY + Hysteria2）"; \
                       dim "多开不提升速度，只增加暴露面、CPU 与排查难度"; }
 
@@ -248,15 +563,21 @@ cmd_audit() {
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   [ "$cc" != "bbr" ] && dim "· 拥塞控制不是 BBR，晚高峰吞吐会明显吃亏 -> 执行 sys"
   [ "$n" -gt 2 ] && dim "· 入站过多 -> 执行 disable <tag> 精简"
-  jq -e '[.inbounds[]|select(.type=="vless" and .tls.reality.enabled==true and (.tls.utls.fingerprint//"")!="chrome")]|length>0' \
-    "$CFG" >/dev/null 2>&1 && dim "· REALITY 未设 utls=chrome -> 执行 tune"
-  jq -e '[.inbounds[]|select(.type=="hysteria2")]|length>0' "$CFG" >/dev/null 2>&1 \
-    && jq -e '[.inbounds[]|select(.type=="hysteria2" and (.obfs.type//"")=="")]|length>0' "$CFG" >/dev/null 2>&1 \
-    && dim "· Hysteria2 未加 obfs，UDP 易被 QoS -> 执行 tune"
+  local e2
+  for e2 in "${IDX[@]}"; do
+    local f2 i2
+    f2=$(printf '%s' "$e2" | cut -d'|' -f1)
+    i2=$(printf '%s' "$e2" | cut -d'|' -f2)
+    jq -e ".inbounds[$i2].type==\"vless\" and .inbounds[$i2].tls.reality.enabled==true and (.inbounds[$i2].tls.utls.fingerprint//\"\")!=\"chrome\"" "$f2" >/dev/null 2>&1 \
+      && dim "· REALITY 未设 utls=chrome -> 执行 tune"
+    jq -e ".inbounds[$i2].type==\"hysteria2\" and (.inbounds[$i2].obfs.type//\"\")==\"\"" "$f2" >/dev/null 2>&1 \
+      && dim "· Hysteria2 未加 obfs，UDP 易被 QoS -> 执行 tune"
+  done
+  [ "$n" -eq 0 ] && dim "· 没有可用入站信息 -> 执行 doctor"
   echo
 }
 
-# ------------------------------------------------------- 2. 系统层优化 ------
+# ------------------------------------------------------- 3. 系统层优化 ------
 cmd_sys() {
   hr; say "系统层优化（BBR / sysctl / swap / 句柄）"; hr
 
@@ -310,7 +631,6 @@ EOF
   [ "$cc" = "bbr" ] && ok "拥塞控制 = bbr" || err "拥塞控制 = $cc（未生效）"
   [ "$qd" = "fq" ]  && ok "队列算法 = fq"   || warn "队列算法 = $qd"
 
-  # ---- swap（2G 小机防 OOM，不拖慢吞吐） ----
   if ! swapon --show 2>/dev/null | grep -q .; then
     say "创建 1G swap"
     if fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none; then
@@ -328,7 +648,6 @@ EOF
     ok "swap 已存在，跳过"
   fi
 
-  # ---- 时间同步（TLS/REALITY 握手依赖） ----
   if command -v timedatectl >/dev/null 2>&1; then
     timedatectl set-ntp true 2>/dev/null || true
     if timedatectl status 2>/dev/null | grep -qi 'synchronized: yes'; then
@@ -338,7 +657,6 @@ EOF
     fi
   fi
 
-  # ---- 提升 sing-box 文件句柄上限 ----
   if detect_svc; then
     mkdir -p "/etc/systemd/system/${SVC}.service.d"
     cat >"/etc/systemd/system/${SVC}.service.d/limits.conf" <<'EOF'
@@ -354,35 +672,37 @@ EOF
   echo
 }
 
-# ------------------------------------------------------- 3. 配置层调参 ------
+# ------------------------------------------------------- 4. 配置层调参 ------
 cmd_tune() {
   hr; say "配置层调参"; hr
-  detect_cfg || { err "未找到配置文件"; return 1; }
+  detect_cfg || { err "未找到配置文件，请先跑 sbopt doctor"; return 1; }
   detect_svc
-  req_pkg jq
-  jq -e '.inbounds' "$CFG" >/dev/null 2>&1 || { err "配置不是标准 .inbounds 结构，跳过"; return 1; }
+  ensure_jq
+  build_index || { err "配置里没有可解析的入站"; return 1; }
 
-  local n i type tag changed=0
-  n=$(inbound_count)
+  dim "配置：$CFG（$([ "$CFG_MULTI" = 1 ] && echo 多文件目录 || echo 单文件)）"
+  local changed=0 e f i type tag
 
-  # ---------- REALITY: 补 utls chrome ----------
-  for ((i=0; i<n; i++)); do
-    type=$(jq -r ".inbounds[$i].type // empty" "$CFG")
+  # ---------- REALITY ----------
+  for e in "${IDX[@]}"; do
+    f=$(printf '%s' "$e" | cut -d'|' -f1)
+    i=$(printf '%s' "$e" | cut -d'|' -f2)
+    tag=$(printf '%s' "$e" | cut -d'|' -f3)
+    type=$(printf '%s' "$e" | cut -d'|' -f4)
     [ "$type" = "vless" ] || continue
-    jq -e ".inbounds[$i].tls.reality.enabled == true" "$CFG" >/dev/null 2>&1 || continue
+    jq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
 
-    tag=$(jq -r ".inbounds[$i].tag // \"inbound-$i\"" "$CFG")
     local fp hs
-    fp=$(jq -r ".inbounds[$i].tls.utls.fingerprint // \"\"" "$CFG")
-    hs=$(jq -r ".inbounds[$i].tls.reality.handshake.server // .inbounds[$i].tls.server_name // \"-\"" "$CFG")
+    fp=$(jq -r ".inbounds[$i].tls.utls.fingerprint // \"\"" "$f")
+    hs=$(jq -r ".inbounds[$i].tls.reality.handshake.server // .inbounds[$i].tls.server_name // \"-\"" "$f")
 
-    hr; printf '  REALITY 入站 [%s]\n' "$tag"
+    hr; printf '  REALITY 入站 [%s]  (%s)\n' "$tag" "$(basename "$f")"
     printf '    伪装站 : %s\n' "$hs"
     printf '    指纹   : %s\n' "${fp:-（未设置）}"
 
     if [ "$fp" != "chrome" ]; then
       if ask "把 utls 指纹设为 chrome？（更像真实浏览器，抗识别）"; then
-        apply_cfg "REALITY[$tag] utls=chrome" \
+        apply_file "$f" "REALITY[$tag] utls=chrome" \
           ".inbounds[$i].tls.utls = {\"enabled\": true, \"fingerprint\": \"chrome\"}" && changed=1
       fi
     else
@@ -390,18 +710,21 @@ cmd_tune() {
     fi
   done
 
-  # ---------- Hysteria2: obfs + 带宽 ----------
-  for ((i=0; i<n; i++)); do
-    type=$(jq -r ".inbounds[$i].type // empty" "$CFG")
+  # ---------- Hysteria2 ----------
+  for e in "${IDX[@]}"; do
+    f=$(printf '%s' "$e" | cut -d'|' -f1)
+    i=$(printf '%s' "$e" | cut -d'|' -f2)
+    tag=$(printf '%s' "$e" | cut -d'|' -f3)
+    type=$(printf '%s' "$e" | cut -d'|' -f4)
     [ "$type" = "hysteria2" ] || continue
-    tag=$(jq -r ".inbounds[$i].tag // \"inbound-$i\"" "$CFG")
-    local port obfs up down
-    port=$(jq -r ".inbounds[$i].listen_port // \"-\"" "$CFG")
-    obfs=$(jq -r ".inbounds[$i].obfs.type // \"\"" "$CFG")
-    up=$(jq -r ".inbounds[$i].up_mbps // \"未设\"" "$CFG")
-    down=$(jq -r ".inbounds[$i].down_mbps // \"未设\"" "$CFG")
 
-    hr; printf '  Hysteria2 入站 [%s]\n' "$tag"
+    local port obfs up down
+    port=$(jq -r ".inbounds[$i].listen_port // \"-\"" "$f")
+    obfs=$(jq -r ".inbounds[$i].obfs.type // \"\"" "$f")
+    up=$(jq -r ".inbounds[$i].up_mbps // \"未设\"" "$f")
+    down=$(jq -r ".inbounds[$i].down_mbps // \"未设\"" "$f")
+
+    hr; printf '  Hysteria2 入站 [%s]  (%s)\n' "$tag" "$(basename "$f")"
     printf '    端口   : %s' "$port"
     [ "$port" = "443" ] && printf '  %s(建议挪走：UDP/443 最易被 QoS)%s' "$c_y" "$c_0"
     printf '\n    混淆   : %s\n' "${obfs:-（未设置）}"
@@ -413,7 +736,7 @@ cmd_tune() {
       if ask "为 Hysteria2 启用 salamander 混淆？（打散 UDP 特征，绕 QoS）"; then
         local pw
         pw=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
-        apply_cfg "HY2[$tag] 启用 obfs" \
+        apply_file "$f" "HY2[$tag] 启用 obfs" \
           ".inbounds[$i].obfs = {\"type\":\"salamander\",\"password\":\"$pw\"}" \
           && { ok "混淆密码：$pw"; dim "客户端需同步填写 obfs-password"; changed=1; }
       fi
@@ -421,7 +744,7 @@ cmd_tune() {
 
     if [ "$port" = "443" ]; then
       if ask "把 Hysteria2 端口从 443 改到 24443？"; then
-        apply_cfg "HY2[$tag] 端口 443->24443" ".inbounds[$i].listen_port = 24443" \
+        apply_file "$f" "HY2[$tag] 端口 443->24443" ".inbounds[$i].listen_port = 24443" \
           && { command -v ufw >/dev/null 2>&1 && ufw allow 24443/udp >/dev/null 2>&1
                ok "别忘了云控制台安全组也放行 24443/udp"
                changed=1; }
@@ -429,18 +752,22 @@ cmd_tune() {
     fi
   done
 
-  # ---------- 多入站提示 ----------
-  if [ "$(inbound_count)" -gt 2 ]; then
-    hr; warn "建议精简入站（当前 $(inbound_count) 个）"
-    jq -r '.inbounds[] | "       \(.tag // "-")  (\(.type)  \(.listen_port // "-"))"' "$CFG"
-    dim "用法：bash $0 disable <tag>"
+  if [ "${#IDX[@]}" -gt 2 ]; then
+    hr; warn "建议精简入站（当前 ${#IDX[@]} 个）"
+    for e in "${IDX[@]}"; do
+      printf '       %s  (%s  %s)\n' \
+        "$(printf '%s' "$e" | cut -d'|' -f3)" \
+        "$(printf '%s' "$e" | cut -d'|' -f4)" \
+        "$(printf '%s' "$e" | cut -d'|' -f5)"
+    done
+    dim "用法：sbopt disable <tag>"
   fi
 
   [ "$changed" = 0 ] && dim "本次未做任何修改"
   echo
 }
 
-# ------------------------------------------- 4. REALITY 伪装站测速选优 ------
+# ------------------------------------------- 5. REALITY 伪装站测速选优 ------
 cmd_dest() {
   hr; say "REALITY 伪装站候选测速"; hr
   req_pkg curl
@@ -449,7 +776,7 @@ cmd_dest() {
                one.one.one.one dl.google.com)
   printf '  %-24s %-10s %-10s %s\n' "站点" "TCP连接" "TLS握手" "HTTP版本"
   printf '  %s\n' "$(printf '%.0s-' {1..58})"
-  local h t c a hv
+  local h c a hv
   for h in "${hosts[@]}"; do
     read -r c a hv < <(
       curl -sI -o /dev/null --max-time 6 --tlsv1.3 \
@@ -464,8 +791,8 @@ cmd_dest() {
   echo
 }
 
-# ------------------------------------------------- 5. 生成客户端链接 --------
-pubkey_from_priv() {   # $1=base64url 私钥 -> 输出 base64url 公钥
+# ------------------------------------------------- 6. 生成客户端链接 --------
+pubkey_from_priv() {
   local p="$1"
   command -v python3 >/dev/null 2>&1 || return 1
   python3 - "$p" <<'PY' 2>/dev/null
@@ -485,8 +812,9 @@ PY
 
 cmd_links() {
   hr; say "生成客户端链接"; hr
-  detect_cfg || { err "未找到配置文件"; return 1; }
-  req_pkg jq
+  detect_cfg || { err "未找到配置文件，请先跑 sbopt doctor"; return 1; }
+  ensure_jq
+  build_index || { err "没有可解析的入站"; return 1; }
 
   local ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
@@ -494,39 +822,36 @@ cmd_links() {
   [ -n "${ip:-}" ] || { err "无法获取公网 IP"; return 1; }
   ok "服务器 IP：$ip"
 
-  local n i type tag port
-  n=$(inbound_count)
-  for ((i=0; i<n; i++)); do
-    type=$(jq -r ".inbounds[$i].type // empty" "$CFG")
-    tag=$(jq -r ".inbounds[$i].tag // \"node-$i\"" "$CFG")
-    port=$(jq -r ".inbounds[$i].listen_port // empty" "$CFG")
-    [ -n "$port" ] || continue
+  local e f i type tag port
+  for e in "${IDX[@]}"; do
+    f=$(printf '%s' "$e" | cut -d'|' -f1)
+    i=$(printf '%s' "$e" | cut -d'|' -f2)
+    tag=$(printf '%s' "$e" | cut -d'|' -f3)
+    type=$(printf '%s' "$e" | cut -d'|' -f4)
+    port=$(printf '%s' "$e" | cut -d'|' -f5)
+    [ "$port" = "-" ] && continue
 
     case "$type" in
       vless)
-        jq -e ".inbounds[$i].tls.reality.enabled == true" "$CFG" >/dev/null 2>&1 || continue
+        jq -e ".inbounds[$i].tls.reality.enabled == true" "$f" >/dev/null 2>&1 || continue
         local uuid sni sid priv pub flow
-        uuid=$(jq -r ".inbounds[$i].users[0].uuid // empty" "$CFG")
-        sni=$(jq -r ".inbounds[$i].tls.server_name // empty" "$CFG")
-        sid=$(jq -r ".inbounds[$i].tls.reality.short_id[0] // empty" "$CFG")
-        priv=$(jq -r ".inbounds[$i].tls.reality.private_key // empty" "$CFG")
-        flow=$(jq -r ".inbounds[$i].users[0].flow // \"xtls-rprx-vision\"" "$CFG")
+        uuid=$(jq -r ".inbounds[$i].users[0].uuid // empty" "$f")
+        sni=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        sid=$(jq -r ".inbounds[$i].tls.reality.short_id[0] // empty" "$f")
+        priv=$(jq -r ".inbounds[$i].tls.reality.private_key // empty" "$f")
+        flow=$(jq -r ".inbounds[$i].users[0].flow // \"xtls-rprx-vision\"" "$f")
         pub=$(pubkey_from_priv "$priv" 2>/dev/null || true)
-        if [ -z "${pub:-}" ]; then
-          warn "无法自动推导 REALITY 公钥，请手动填入 pbk（或用 sing-box generate reality-keypair 重新配对）"
-          pub="<公钥>"
-        fi
+        [ -z "${pub:-}" ] && { warn "无法自动推导 REALITY 公钥，请用 sing-box generate reality-keypair 重配"; pub="<公钥>"; }
         hr; printf '  [%s] VLESS-REALITY\n' "$tag"
         printf '  vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s-REALITY\n' \
           "$uuid" "$ip" "$port" "$flow" "$sni" "$pub" "$sid" "$tag"
         ;;
       hysteria2)
-        local pw sni2 obfst obfsp
-        pw=$(jq -r ".inbounds[$i].users[0].password // empty" "$CFG")
-        sni2=$(jq -r ".inbounds[$i].tls.server_name // empty" "$CFG")
-        obfst=$(jq -r ".inbounds[$i].obfs.type // empty" "$CFG")
-        obfsp=$(jq -r ".inbounds[$i].obfs.password // empty" "$CFG")
-        local extra=""
+        local pw sni2 obfst obfsp extra=""
+        pw=$(jq -r ".inbounds[$i].users[0].password // empty" "$f")
+        sni2=$(jq -r ".inbounds[$i].tls.server_name // empty" "$f")
+        obfst=$(jq -r ".inbounds[$i].obfs.type // empty" "$f")
+        obfsp=$(jq -r ".inbounds[$i].obfs.password // empty" "$f")
         [ -n "$obfst" ] && extra="&obfs=${obfst}&obfs-password=${obfsp}"
         hr; printf '  [%s] Hysteria2\n' "$tag"
         printf '  hysteria2://%s@%s:%s?sni=%s&insecure=1%s#%s-HY2\n' \
@@ -540,19 +865,22 @@ cmd_links() {
   echo
 }
 
-# --------------------------------------------------- 6. 端口 / 启停入站 -----
+# --------------------------------------------------- 7. 端口 / 启停入站 -----
 cmd_port() {
-  local tag="${1:-}" port="${2:-}"
-  [ -n "$tag" ] && [ -n "$port" ] || { err "用法：bash $0 port <tag> <端口>"; return 1; }
+  local key="${1:-}" port="${2:-}"
+  [ -n "$key" ] && [ -n "$port" ] || { err "用法：sbopt port <tag|type> <端口>"; return 1; }
   detect_cfg || { err "未找到配置文件"; return 1; }
-  jq -e --arg t "$tag" '[.inbounds[]|select(.tag==$t)]|length>0' "$CFG" >/dev/null 2>&1 \
-    || { err "没有 tag 为 $tag 的入站"; return 1; }
+  ensure_jq
+  build_index || { err "没有可解析的入站"; return 1; }
 
-  local type
-  type=$(jq -r --arg t "$tag" '.inbounds[]|select(.tag==$t)|.type' "$CFG")
-  apply_cfg "$tag 端口 -> $port" \
-    --arg t "$tag" --arg p "$port" \
-    '(.inbounds[] | select(.tag==$t) | .listen_port) |= ($p|tonumber)' || return 1
+  local loc f i type
+  loc=$(locate_inbound "$key") || { err "找不到 tag/type 为 $key 的入站"; return 1; }
+  f=$(printf '%s' "$loc" | cut -d'|' -f1)
+  i=$(printf '%s' "$loc" | cut -d'|' -f2)
+  type=$(jq -r ".inbounds[$i].type" "$f")
+
+  apply_file "$f" "$key 端口 -> $port" \
+    --arg p "$port" "(.inbounds[$i].listen_port) |= (\$p|tonumber)" || return 1
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     case "$type" in
@@ -565,29 +893,48 @@ cmd_port() {
 }
 
 cmd_disable() {
-  local tag="${1:-}"
-  [ -n "$tag" ] || { err "用法：bash $0 disable <tag>"; return 1; }
+  local key="${1:-}"
+  [ -n "$key" ] || { err "用法：sbopt disable <tag|type>"; return 1; }
   detect_cfg || { err "未找到配置文件"; return 1; }
-  local cnt
-  cnt=$(jq -r --arg t "$tag" '[.inbounds[]|select(.tag==$t)]|length' "$CFG")
-  [ "$cnt" -gt 0 ] || { err "没有 tag 为 $tag 的入站"; return 1; }
+  ensure_jq
+  build_index || { err "没有可解析的入站"; return 1; }
+
+  local loc f i tag
+  loc=$(locate_inbound "$key") || { err "找不到 tag/type 为 $key 的入站"; return 1; }
+  f=$(printf '%s' "$loc" | cut -d'|' -f1)
+  i=$(printf '%s' "$loc" | cut -d'|' -f2)
+  tag=$(jq -r ".inbounds[$i].tag // \"$key\"" "$f")
 
   mkdir -p "$DIS"
-  jq --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CFG" >"$DIS/$tag.json"
-  apply_cfg "停用入站 [$tag]" --arg t "$tag" '.inbounds |= map(select(.tag != $t))' \
-    && ok "入站定义已存入 $DIS/$tag.json（可用 enable 恢复）"
+  local safe
+  safe=$(printf '%s' "$tag" | tr '/ ' '__')
+  jq ".inbounds[$i]" "$f" >"$DIS/$safe.json"
+  apply_file "$f" "停用入站 [$tag]" "del(.inbounds[$i])" \
+    && ok "入站定义已存入 $DIS/$safe.json（可用 enable 恢复）"
 }
 
 cmd_enable() {
-  local tag="${1:-}"
-  [ -n "$tag" ] || { err "用法：bash $0 enable <tag>"; return 1; }
-  [ -f "$DIS/$tag.json" ] || { err "找不到已停用的 [$tag]"; return 1; }
+  local key="${1:-}"
+  [ -n "$key" ] || { err "用法：sbopt enable <tag>"; return 1; }
   detect_cfg || { err "未找到配置文件"; return 1; }
-  apply_cfg "恢复入站 [$tag]" --slurpfile n "$DIS/$tag.json" '.inbounds += $n' \
-    && rm -f "$DIS/$tag.json"
+  ensure_jq
+  local safe
+  safe=$(printf '%s' "$key" | tr '/ ' '__')
+  [ -f "$DIS/$safe.json" ] || { err "找不到已停用的 [$key]"; return 1; }
+
+  # 回加到原目录的第一个文件（多文件模式）或唯一文件
+  local target
+  if [ "$CFG_MULTI" = 1 ]; then
+    target=$(cfg_files | head -1)
+    dim "多文件模式：追加到 $target"
+  else
+    target="$CFG"
+  fi
+  apply_file "$target" "恢复入站 [$key]" --slurpfile n "$DIS/$safe.json" '.inbounds += $n' \
+    && rm -f "$DIS/$safe.json"
 }
 
-# ------------------------------------------------------- 7. 流量守护 --------
+# ------------------------------------------------------- 8. 流量守护 --------
 cmd_traffic() {
   hr; say "流量统计与配额提醒"; hr
   req_pkg vnstat
@@ -613,21 +960,24 @@ EOF
   echo
 }
 
-# ------------------------------------------------------------ 8. 回滚 ------
+# ------------------------------------------------------------ 9. 回滚 ------
 cmd_rollback() {
   hr; say "可用备份"; hr
-  ls -1t "$BK"/*.json 2>/dev/null | head -10 | nl -w2 -s'. ' | sed 's/^/  /' || {
-    err "没有备份"; return 1; }
+  ls -1t "$BK"/* 2>/dev/null | head -10 | nl -w2 -s'. ' | sed 's/^/  /' || { err "没有备份"; return 1; }
   echo
-  local f
-  f=$(ls -1t "$BK"/*.json 2>/dev/null | head -1)
-  [ -n "${f:-}" ] || return 1
-  ask "回滚到 $(basename "$f") ?" || return 0
-  cp -a "$f" "$CFG"
-  restart_svc && ok "已回滚并重启" || err "重启失败，请手工检查 $CFG"
+  local t b
+  t=$(cat "$BASE/last_target" 2>/dev/null)
+  b=$(cat "$BASE/last_backup" 2>/dev/null)
+  if [ -z "${b:-}" ] || [ ! -f "$b" ]; then
+    err "没有最近一次备份记录"; return 1
+  fi
+  printf '  目标文件: %s\n  备份文件: %s\n' "${t:-?}" "$b"
+  ask "回滚到 $(basename "$b") ?" || return 0
+  cp -a "$b" "$t"
+  restart_svc && ok "已回滚并重启" || err "重启失败，请手工检查 $t"
 }
 
-# ------------------------------------------------------------ 9. 自更新 -----
+# ----------------------------------------------------------- 10. 自更新 -----
 self_version() { grep -m1 '^# VERSION' "$1" 2>/dev/null | awk '{print $3}'; }
 
 cmd_update() {
@@ -638,19 +988,15 @@ cmd_update() {
   tmp=$(mktemp /tmp/sbopt.XXXXXX)
 
   if ! curl -fsSL --max-time 30 "$REPO_RAW/sb-opt.sh" -o "$tmp"; then
-    err "下载失败，请检查网络或仓库是否公开"
-    rm -f "$tmp"; return 1
+    err "下载失败，请检查网络或仓库是否公开"; rm -f "$tmp"; return 1
   fi
   if ! bash -n "$tmp" 2>/dev/null; then
-    err "下载的版本语法校验失败，已放弃（可能是半截文件）"
-    rm -f "$tmp"; return 1
+    err "下载的版本语法校验失败，已放弃"; rm -f "$tmp"; return 1
   fi
 
   old=$(self_version "$self"); new=$(self_version "$tmp")
   printf '  当前版本 : %s\n  远端版本 : %s\n' "${old:-?}" "${new:-?}"
-  if [ "$old" = "$new" ]; then
-    ok "已是最新，无需更新"; rm -f "$tmp"; return 0
-  fi
+  if [ "$old" = "$new" ]; then ok "已是最新，无需更新"; rm -f "$tmp"; return 0; fi
   cp -a "$self" "$BASE/sb-opt.sh.old"
   install -m 755 "$tmp" "$self"
   rm -f "$tmp"
@@ -676,9 +1022,10 @@ ${c_b}
     6) 流量守护      vnstat + 每日 20GB 提醒
     7) 回滚          恢复最近一次备份
     8) 更新          从 GitHub 拉取最新版脚本
+    9) 诊断          配置探测失败时用，输出各来源原始结果
     0) 退出
 ${c_d}
-  提示：先跑 1 看现状，再跑 2，最后按需跑 3/5
+  提示：体检报「未找到配置」时，先跑 9
 ${c_0}
 EOF
     local c
@@ -692,6 +1039,7 @@ EOF
       6) cmd_traffic ;;
       7) cmd_rollback ;;
       8) cmd_update ;;
+      9) cmd_doctor ;;
       0|q) exit 0 ;;
       *) ;;
     esac
@@ -703,6 +1051,7 @@ EOF
 need_root
 mkdir -p "$BASE"
 case "${1:-}" in
+  doctor)   cmd_doctor ;;
   audit)    cmd_audit ;;
   sys)      cmd_sys ;;
   tune)     cmd_tune ;;
@@ -716,5 +1065,5 @@ case "${1:-}" in
   update)   cmd_update ;;
   version|-v) self_version "${BASH_SOURCE[0]}" ;;
   menu|"")  menu ;;
-  *)        sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

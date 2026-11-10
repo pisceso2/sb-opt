@@ -32,6 +32,7 @@ sbopt
 | **启停入站** | `disable <tag>` 精简掉 TUIC / Argo，`enable <tag>` 随时恢复 |
 | **流量守护** | vnstat 统计 + 每日超 15GB 提醒（600GB 月配额） |
 | **回滚** | 一键恢复最近一次备份 |
+| **诊断** | 配置探测失败时输出各来源原始结果（进程/unit/docker/已知路径/find） |
 
 ### 安全设计
 
@@ -48,6 +49,7 @@ sbopt
 
 ```bash
 sbopt                  # 交互菜单
+sbopt doctor           # 配置探测诊断（找不到配置时先跑这个）
 sbopt audit            # 只体检，只读，不改任何东西
 sbopt sys              # 系统层优化（BBR / sysctl / swap / 句柄）
 sbopt tune             # 配置层调参（逐项确认）
@@ -62,7 +64,26 @@ sbopt disable <tag>    # 停用某入站，如：sbopt disable argo
 sbopt enable <tag>     # 恢复被停用的入站
 ```
 
-`<tag>` 是配置里 `inbounds[].tag` 的名字，`sbopt audit` 会列出来。
+`<tag>` 是配置里 `inbounds[].tag` 的名字，`sbopt audit` 会列出来；记不住也**可以直接写协议名**，如 `sbopt disable tuic`、`sbopt port hysteria2 24443`。
+
+## 配置探测
+
+不同一键脚本的配置位置差别很大，`v1.1.0` 起按五路探测：
+
+1. 正在运行的 `sing-box`/`xray` 进程命令行里的 `-c` / `--config`
+2. systemd 单元 `ExecStart` 里的 `-c` / `--config`
+3. docker 容器（自动把容器内路径映射到宿主机路径，重启走 `docker restart`）
+4. 内置已知路径（含 mack-a 的 `/etc/v2ray-agent/...`）
+5. `/etc`、`/opt`、`/root`、`/usr/local/etc` 下 5 层内的受限 `find`
+
+同时支持两种布局：
+
+| 布局 | 例子 | 处理方式 |
+|---|---|---|
+| 单文件 | `/etc/sing-box/config.json` | 直接改 |
+| 多文件目录 | `/etc/v2ray-agent/sing-box/conf/config/*.json` | 定位到含该入站的文件，在临时副本上 `sing-box check` 通过后才替换 |
+
+还找不到就跑 `sbopt doctor`，把输出整段贴出来。
 
 ---
 
