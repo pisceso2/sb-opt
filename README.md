@@ -99,6 +99,7 @@ sbopt enable <tag>     # 恢复被停用的入站
 - 服务名只会是真正的代理单元。`sing-box`、`xray`、`hysteria-server`、`*-sing-box` 之类放行；`argo`、`nginx` 一律拒绝，**不会重启错服务**
 - 二进制路径会增加 5 条来源：`/proc/<pid>/exe` → argv[0]（含相对路径还原）→ systemd `ExecStart` → 常见安装位置 → 受限 `find`
 - `audit` 会点名列出「名字像 inbound 却解析不出入站」的配置文件（如 `inbounds` 为空数组），并把它和端口监听列表对账
+- `restart_svc` 在服务名未探测到时会自动 `detect_svc`（此前 `fixjson` 没调用过 `detect_svc`，导致重启直接返回失败、日志为空）
 - 重启改为轮询等待（最多 20 秒 × 3 次尝试），并打印 `journalctl` 真实报错，避免 2C2G 上启动慢被误判为失败
 - 写回配置用 `cat` 覆写而非 `install -m 600`，保留原文件权限/属主（sing-box 非 root 运行时不会被锁死）
 - 目录态校验改用 `sing-box check -C <dir>`（`-c` 只接受单个文件，传目录会报 `is a directory`）；所有读配置的地方统一走 JSONC 兼容层，改配置前会提示「写回后注释会丢失」
