@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.4.2
+# VERSION 1.4.3
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -585,7 +585,7 @@ check_cfg() {   # 校验 CFG（单文件或目录）；$1 可选=替换后的临
 
 # 服务最后的错误日志（重启失败时给用户看真正的原因）
 svc_last_error() {
-  [ -n "$SVC" ] || return 0
+  [ -n "$SVC" ] || detect_svc 2>/dev/null || return 0
   command -v journalctl >/dev/null 2>&1 || return 0
   local log
   log=$(journalctl -u "${SVC}.service" -n 12 --no-pager -o cat 2>/dev/null | tail -12)
@@ -604,7 +604,12 @@ restart_svc() {
     done
     return 1
   fi
-  [ -n "$SVC" ] || return 1
+  if [ -z "$SVC" ]; then
+    if ! detect_svc; then
+      err "未找到 sing-box/xray 服务名，无法重启（服务可能由 docker 或前台进程管理）"
+      return 1
+    fi
+  fi
   _svc_safe "$SVC" || { err "拒绝重启非代理服务：$SVC（请先确认服务名）"; return 1; }
 
   local attempt i
@@ -1340,6 +1345,7 @@ cmd_update() {
 cmd_fixjson() {
   hr; say "JSONC 规范化"; hr
   detect_cfg || { err "未找到配置，请先跑 sbopt doctor"; return 1; }
+  detect_svc && dim "服务：$SVC" || warn "未探测到 systemd 服务，重启可能失败"
   ensure_jq || return 1
 
   local -a bad=()
