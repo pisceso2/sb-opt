@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.1.0
+# VERSION 1.1.1
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -993,6 +993,11 @@ cmd_update() {
   if ! bash -n "$tmp" 2>/dev/null; then
     err "下载的版本语法校验失败，已放弃"; rm -f "$tmp"; return 1
   fi
+  # 完整性：末尾必须有 __END_SBOPT__ 标记，否则是被截断的半截文件
+  if ! grep -q '^# __END_SBOPT__' "$tmp" || [ -z "$(self_version "$tmp")" ]; then
+    err "下载的文件不完整（缺结束标记），已放弃。稍后重试或检查网络"
+    rm -f "$tmp"; return 1
+  fi
 
   old=$(self_version "$self"); new=$(self_version "$tmp")
   printf '  当前版本 : %s\n  远端版本 : %s\n' "${old:-?}" "${new:-?}"
@@ -1047,6 +1052,28 @@ EOF
   done
 }
 
+usage() {
+  cat <<'EOF'
+sb-opt —— sing-box / xray 一体机优化工具
+
+  sbopt                 交互菜单（推荐从这里开始）
+  sbopt doctor          配置探测诊断（找不到配置时先跑）
+  sbopt audit           只读体检
+  sbopt sys             系统层优化（BBR + sysctl + swap + 句柄）
+  sbopt tune            配置层调参（REALITY 指纹 / HY2 混淆端口）
+  sbopt dest            REALITY 伪装站测速
+  sbopt links           生成 vless:// 与 hysteria2:// 链接
+  sbopt traffic         流量统计与每日提醒
+  sbopt rollback        回滚最近一次备份
+  sbopt update          从 GitHub 拉取最新版
+  sbopt version         查看当前版本
+
+  sbopt port <tag|type> <端口>   例如：sbopt port hysteria2 24443
+  sbopt disable <tag|type>       例如：sbopt disable tuic
+  sbopt enable <tag>             恢复被停用的入站
+EOF
+}
+
 # ------------------------------------------------------------ 入口 --------
 need_root
 mkdir -p "$BASE"
@@ -1065,5 +1092,7 @@ case "${1:-}" in
   update)   cmd_update ;;
   version|-v) self_version "${BASH_SOURCE[0]}" ;;
   menu|"")  menu ;;
-  *)        sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)        usage ;;
 esac
+
+# __END_SBOPT__  ← 完整性标记，缺失说明文件被截断，请重新安装

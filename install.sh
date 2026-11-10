@@ -39,6 +39,17 @@ curl -fsSL --max-time 60 "$SELF_URL" -o "$TMP" || { err "下载失败"; rm -f "$
 echo ">>> 语法校验"
 bash -n "$TMP" || { err "下载的文件语法有误，未安装"; rm -f "$TMP"; exit 1; }
 
+echo ">>> 完整性校验"
+if ! grep -q '^# __END_SBOPT__' "$TMP"; then
+  err "下载的文件不完整（缺少结束标记，疑似被截断）"; rm -f "$TMP"; exit 1
+fi
+DL_VERSION=$(grep -m1 '^# VERSION' "$TMP" | awk '{print $3}')
+DL_LINES=$(wc -l < "$TMP")
+if [ -z "$DL_VERSION" ] || [ "$DL_LINES" -lt 500 ]; then
+  err "下载的文件异常（版本='${DL_VERSION:-空}' 行数=$DL_LINES）"; rm -f "$TMP"; exit 1
+fi
+ok "完整性校验通过：版本 $DL_VERSION，$DL_LINES 行"
+
 if [ -f "$DEST" ]; then
   OLD=$(grep -m1 '^# VERSION' "$DEST" | awk '{print $3}')
   cp -a "$DEST" "/root/sb-opt/sb-opt.sh.old"

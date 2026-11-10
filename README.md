@@ -85,6 +85,18 @@ sbopt enable <tag>     # 恢复被停用的入站
 
 还找不到就跑 `sbopt doctor`，把输出整段贴出来。
 
+## 下载完整性
+
+脚本末尾有 `# __END_SBOPT__` 标记，`install.sh` 和 `sbopt update` 都会校验它加版本号加行数，**被截断的半截文件不会被安装**（这是 v1.1.1 修的：早期版本因网络中断可能装上只有几十行的残文件，运行后毫无反应）。
+
+手动自查：
+
+```bash
+wc -l /root/sb-opt/sb-opt.sh              # 应 >= 500，1.1.1 约 1098
+grep -m1 '^# VERSION' /root/sb-opt/sb-opt.sh
+tail -1 /root/sb-opt/sb-opt.sh            # 应看到 __END_SBOPT__
+```
+
 ---
 
 ## 升级
