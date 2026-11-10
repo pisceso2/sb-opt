@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.4.1
+# VERSION 1.4.2
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -583,16 +583,41 @@ check_cfg() {   # 校验 CFG（单文件或目录）；$1 可选=替换后的临
   return 1
 }
 
+# 服务最后的错误日志（重启失败时给用户看真正的原因）
+svc_last_error() {
+  [ -n "$SVC" ] || return 0
+  command -v journalctl >/dev/null 2>&1 || return 0
+  local log
+  log=$(journalctl -u "${SVC}.service" -n 12 --no-pager -o cat 2>/dev/null | tail -12)
+  [ -n "${log:-}" ] && printf '%s\n' "$log" | sed 's/^/       /' >&2
+  return 0
+}
+
+# 重启并轮询等待就绪：2C2G 上 12 个入站启动常需 3-5 秒，2 秒判定会误判失败
 restart_svc() {
   if [ -n "$CONTAINER" ]; then
-    docker restart "$CONTAINER" >/dev/null 2>&1 && return 0
+    local i
+    docker restart "$CONTAINER" >/dev/null 2>&1 || return 1
+    for i in $(seq 1 30); do
+      sleep 0.5
+      [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ] && return 0
+    done
     return 1
   fi
   [ -n "$SVC" ] || return 1
   _svc_safe "$SVC" || { err "拒绝重启非代理服务：$SVC（请先确认服务名）"; return 1; }
-  systemctl restart "$SVC" >/dev/null 2>&1
-  sleep 2
-  systemctl is-active --quiet "$SVC"
+
+  local attempt i
+  for attempt in 1 2 3; do
+    systemctl restart "$SVC" >/dev/null 2>&1
+    for i in $(seq 1 40); do          # 最多等 20 秒
+      sleep 0.5
+      systemctl is-active --quiet "$SVC" && return 0
+      systemctl is-failed --quiet "$SVC" 2>/dev/null && break
+    done
+    [ "$attempt" -lt 3 ] && sleep 2    # 端口释放/依赖就绪，再试一次
+  done
+  return 1
 }
 
 # apply_file <文件> <说明> [jq选项...] <jq表达式>
@@ -615,13 +640,17 @@ apply_file() {
     rm -f "$tmp"; return 1
   fi
   backup_file "$f" "$desc"
-  install -m 600 "$tmp" "$f"
+  # 用 cat 覆写：保留原文件的权限/属主/ACL（sing-box 可能以非 root 运行）
+  if ! cat "$tmp" >"$f" 2>/dev/null; then
+    err "$desc：写入 $f 失败"; rm -f "$tmp"; return 1
+  fi
   rm -f "$tmp"
   if restart_svc; then
     ok "$desc —— 已生效"; log "applied: $desc ($f)"
     return 0
   fi
   err "$desc：重启失败，正在回滚"
+  dim "最近日志："; svc_last_error
   rollback_last
   return 1
 }
@@ -632,7 +661,12 @@ rollback_last() {
   b=$(cat "$BASE/last_backup" 2>/dev/null)
   if [ -n "${t:-}" ] && [ -n "${b:-}" ] && [ -f "$b" ]; then
     cp -a "$b" "$t"
-    restart_svc && ok "已回滚 $(basename "$b") -> $t" || err "回滚后服务仍无法启动，请手工检查"
+    if restart_svc; then
+      ok "已回滚 $(basename "$b") -> $t"
+    else
+      err "回滚后服务仍无法启动，请手工检查"
+      dim "最近日志："; svc_last_error
+    fi
     log "rollback $b -> $t"
     return 0
   fi
@@ -771,11 +805,15 @@ cmd_audit() {
 
   # 对账：对外监听端口 vs 配置里声明的端口，抓「配置没读全」
   local -a declared=()
-  local pe pp
-  for pe in "${IDX[@]}"; do
-    pp=$(printf '%s' "$pe" | cut -d'|' -f5)
-    [ "$pp" != "-" ] && declared+=("$pp")
-  done
+  local pe pp f3 rf3
+  while IFS= read -r pe; do
+    [ -n "$pe" ] && declared+=("$pe")
+  done < <(
+    while IFS= read -r f3; do
+      rf3=$(readable_file "$f3") || continue
+      jq -r '.. | objects | .listen_port? // empty' "$rf3" 2>/dev/null
+    done < <(cfg_files)
+  )
   local -a unknown=()
   while read -r pp; do
     [ -n "$pp" ] || continue
@@ -806,15 +844,17 @@ cmd_audit() {
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   [ "$cc" != "bbr" ] && dim "· 拥塞控制不是 BBR，晚高峰吞吐会明显吃亏 -> 执行 sys"
   [ "$n" -gt 2 ] && dim "· 入站过多 -> 执行 disable <tag> 精简"
-  local e2
+  local e2 seen_reality=0 seen_obfs=0
   for e2 in "${IDX[@]}"; do
     local f2 i2
     f2=$(printf '%s' "$e2" | cut -d'|' -f1)
     i2=$(printf '%s' "$e2" | cut -d'|' -f2)
-    qjq -e ".inbounds[$i2].type==\"vless\" and .inbounds[$i2].tls.reality.enabled==true and (.inbounds[$i2].tls.utls.fingerprint//\"\")!=\"chrome\"" "$f2" >/dev/null 2>&1 \
-      && dim "· REALITY 未设 utls=chrome -> 执行 tune"
-    qjq -e ".inbounds[$i2].type==\"hysteria2\" and (.inbounds[$i2].obfs.type//\"\")==\"\"" "$f2" >/dev/null 2>&1 \
-      && dim "· Hysteria2 未加 obfs，UDP 易被 QoS -> 执行 tune"
+    if [ "$seen_reality" = 0 ] && jq -e ".inbounds[$i2].type==\"vless\" and .inbounds[$i2].tls.reality.enabled==true and (.inbounds[$i2].tls.utls.fingerprint//\"\")!=\"chrome\"" "$(readable_file "$f2")" >/dev/null 2>&1; then
+      dim "· REALITY 未设 utls=chrome -> 执行 tune"; seen_reality=1
+    fi
+    if [ "$seen_obfs" = 0 ] && jq -e ".inbounds[$i2].type==\"hysteria2\" and (.inbounds[$i2].obfs.type//\"\")==\"\"" "$(readable_file "$f2")" >/dev/null 2>&1; then
+      dim "· Hysteria2 未加 obfs，UDP 易被 QoS -> 执行 tune"; seen_obfs=1
+    fi
   done
   [ "$n" -eq 0 ] && dim "· 没有可用入站信息 -> 执行 doctor"
   echo
@@ -1362,7 +1402,7 @@ cmd_fixjson() {
 
   local src bk new
   while IFS='|' read -r src bk new; do
-    install -m 600 "$new" "$src"
+    cat "$new" >"$src"
   done < <(printf '%s\n' "${pairs[@]}")
 
   if restart_svc; then
@@ -1374,6 +1414,7 @@ cmd_fixjson() {
   fi
 
   err "重启失败，正在逐个恢复备份"
+  dim "最近日志："; svc_last_error
   while IFS='|' read -r src bk _; do
     cp -a "$bk" "$src"
   done < <(printf '%s\n' "${pairs[@]}")
