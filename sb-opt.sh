@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# VERSION 1.5.2
+# VERSION 1.5.3
 #  sb-opt.sh  ——  sing-box / Xray 一体机 性能优化 · 体检 · 排障 工具
 #
 #  适用：Debian 11/12、Ubuntu 20.04+（内核 >= 4.9），root 运行
@@ -731,7 +731,12 @@ cmd_audit() {
   printf '  拥塞控制: %s' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ] \
     && printf '  %s✓%s\n' "$c_g" "$c_0" || printf '  %s✗ 未开启（跑 sys 修复）%s\n' "$c_y" "$c_0"
-  printf '  qdisc   : %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  local _dev _q
+  _dev=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+  _q=""
+  [ -n "${_dev:-}" ] && _q=$(tc qdisc show dev "$_dev" 2>/dev/null | awk '{print $2}' | head -1)
+  printf '  qdisc   : %s（默认） / %s（%s 实际）\n' \
+    "$(sysctl -n net.core.default_qdisc 2>/dev/null)" "${_q:-未知}" "${_dev:-?}"
   printf '  文件句柄: %s\n' "$(ulimit -n)"
 
   hr
@@ -915,9 +920,19 @@ EOF
   sysctl --system >/dev/null 2>&1
   local cc qd
   cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-  qd=$(sysctl -n net.core.default_qdisc)
   [ "$cc" = "bbr" ] && ok "拥塞控制 = bbr" || err "拥塞控制 = $cc（未生效）"
-  [ "$qd" = "fq" ]  && ok "队列算法 = fq"   || warn "队列算法 = $qd"
+
+  qd=$(sysctl -n net.core.default_qdisc)
+  if [ "$qd" != "fq" ]; then
+    warn "默认队列被其它 sysctl 覆盖成 $qd，用 99-zz 抢回优先级"
+    cat >/etc/sysctl.d/99-zz-sb-opt-qdisc.conf <<'EOF'
+# sb-opt：排在最后，覆盖其他 sysctl.d 里的 fq_pie 等设置
+net.core.default_qdisc = fq
+EOF
+    sysctl --system >/dev/null 2>&1
+    qd=$(sysctl -n net.core.default_qdisc)
+  fi
+  [ "$qd" = "fq" ] && ok "默认队列 = fq" || warn "默认队列仍为 $qd（有程序在运行时改它，只影响新建网卡）"
 
   # default_qdisc 只作用于新建网卡；已存在的网卡要 tc 显式替换
   local dev main_dev
