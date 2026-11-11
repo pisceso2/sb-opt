@@ -118,6 +118,36 @@ tail -1 /root/sb-opt/sb-opt.sh            # 应看到 __END_SBOPT__
 
 ---
 
+## 一键回滚（撤销全部改动）
+
+`sbopt-restore.sh` 把 sb-opt 做过的事**全部还原到初始状态**，独立运行、不依赖 `sbopt` 本身：
+
+```bash
+# 下载
+curl -fsSL https://cdn.jsdelivr.net/gh/pisceso2/sb-opt@main/sbopt-restore.sh -o /root/sbopt-restore.sh
+chmod +x /root/sbopt-restore.sh
+
+# 先看计划，不动文件
+bash /root/sbopt-restore.sh --dry-run
+
+# 还原配置（停用的入站、hy2 混淆、JSONC 注释）
+bash /root/sbopt-restore.sh
+
+# 连系统层一起还原（sysctl / tc / swap / 句柄）
+bash /root/sbopt-restore.sh --sys
+```
+
+还原原理：同一个文件在 `/root/sb-opt/backups/` 里可能有多份备份，取**时间最早的那份**，即该文件被改动前的原始内容。
+
+安全机制：
+
+| 机制 | 说明 |
+|---|---|
+| 撤销前快照 | 当前状态存到 `/root/sb-opt/restore-snapshot/<时间戳>/` |
+| 预演校验 | 先在临时目录 `sing-box check -C`，通过才落盘 |
+| 失败自动回滚 | 落盘后重启失败 → 自动用快照还原到「撤销前」 |
+| 反悔 | `cp -a $(cat /root/sb-opt/last-snapshot)/* /etc/sing-box/conf/ && systemctl restart sing-box` |
+
 ## 下载源
 
 `install.sh` 与 `sbopt update` 会**依次尝试 4 个源**，前一个不通自动换下一个：
